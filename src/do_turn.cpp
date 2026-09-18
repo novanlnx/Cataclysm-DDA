@@ -430,6 +430,10 @@ static bool wait_for_turn_action( avatar &u, map &m )
         if( !fs::exists( command, ec ) ) {
             ec.clear();
             inp_mngr.pump_events();
+            // Keep the game UI alive while an external Nova decision is pending.
+            // This lets the dedicated Nova panel visibly update instead of leaving
+            // the player staring at an apparently frozen screen.
+            ui_manager::redraw();
             std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
             continue;
         }
