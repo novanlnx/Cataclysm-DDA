@@ -32,8 +32,17 @@ def utc_now() -> str:
 def write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    last_error = None
+    for _ in range(40):
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.025)
+    if last_error:
+        raise last_error
 
 def write_json_atomic(path: Path, obj: dict) -> None:
     write_text_atomic(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
@@ -190,7 +199,12 @@ class ThoughtFeed:
         if len(clean) > 140:
             clean = clean[:137] + "..."
         self.lines.append(clean)
-        write_text_atomic(self.path, "\n".join(self.lines) + "\n")
+        try:
+            write_text_atomic(self.path, "\n".join(self.lines) + "\n")
+        except OSError:
+            # The in-game panel may momentarily have the file open on Windows.
+            # A missed visual refresh must never terminate the agent.
+            pass
 
 def situation_summary(state: dict, wm: WorldModel) -> dict:
     tiles = tile_map(state)
@@ -267,13 +281,23 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
         backtrack = wm.is_immediate_backtrack(state, dx, dy)
 
         if t.get("openable"):
-            # Opening a closed boundary is strong progress when indoors or looping.
-            score = 0.78 + (0.12 if state.get("indoors") else 0.0) + (0.08 if loop else 0.0)
+            terrain = str(t.get("terrain", ""))
+            lower_terrain = terrain.lower()
+            is_curtain = "curtain" in lower_terrain
+            if is_curtain:
+                score = 0.48 + (0.08 if state.get("indoors") else 0.0)
+                label = f"open {name} curtains"
+                progress = "improves visibility but is not an exit"
+            else:
+                # A closed door/boundary is strong progress when indoors or looping.
+                score = 0.78 + (0.12 if state.get("indoors") else 0.0) + (0.08 if loop else 0.0)
+                label = f"open {name} {terrain or 'door'}"
+                progress = "reveals/accesses a new boundary"
             actions.append({
                 "action": "open_adjacent", "dx": dx, "dy": dy,
-                "label": f"open {name} {t.get('terrain','door')}",
+                "label": label,
                 "controller_score": min(1.0, score),
-                "progress": "reveals/accesses a new boundary",
+                "progress": progress,
             })
 
         if t.get("passable"):
@@ -413,7 +437,9 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         "A safe action is not automatically useful: prefer actions that make progress. "
         "Repeated backtracking and pacing are bad unless there is a concrete reason. "
         "A closed door while indoors may be an exit or access to unexplored space. "
-        "Visible useful objects matter, even when the current capability set cannot pick them up yet. "
+        "Visible useful objects matter, but an active intention must be achievable with allowed_actions now. "
+        "If food or supplies are visible but there is no pickup/use action available, remember them as future resources "
+        "instead of choosing 'gather supplies' as the current intention. "
         "Never invent an action that is not in allowed_actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
     )
