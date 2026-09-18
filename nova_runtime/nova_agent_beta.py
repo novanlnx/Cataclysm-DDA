@@ -26,6 +26,22 @@ CARDINALS = {
     "east": (1, 0),
 }
 
+# Hard validation gate.  No controller path -- Qwen, deterministic safety,
+# fallback, or future helper code -- may dispatch outside this set.
+VALIDATION_DISPATCH_ALLOWLIST = {
+    "observe",
+    "move_one_tile",
+    "open_adjacent",
+    "wait_one_turn",
+    "pickup_consumable",
+    "eat_best_food",
+    "drink_best",
+}
+
+MIN_HUNGER_IMPROVEMENT = 5
+MIN_THIRST_IMPROVEMENT = 5
+MIN_STORED_KCAL_IMPROVEMENT = 10
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -378,7 +394,6 @@ def deterministic_safety(state: dict, actions: list[dict]):
         return next((a for a in actions if a.get("action") == name), None)
     thirst = int(state.get("thirst", 0) or 0)
     hunger = int(state.get("hunger", 0) or 0)
-    sleepy = int(state.get("sleepiness", 0) or 0)
     stamina = int(state.get("stamina", 0) or 0)
     stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
 
@@ -386,8 +401,6 @@ def deterministic_safety(state: dict, actions: list[dict]):
         return find("drink_best"), f"urgent thirst ({thirst})"
     if hunger > 100 and find("eat_best_food"):
         return find("eat_best_food"), f"urgent hunger ({hunger})"
-    if sleepy >= 383 and find("sleep"):
-        return find("sleep"), f"dead tired ({sleepy})"
     if stamina / stamina_max < 0.25 and find("wait_one_turn"):
         return find("wait_one_turn"), f"very low stamina ({stamina}/{stamina_max})"
     return None
@@ -412,7 +425,6 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
             "avoid_repeated_pacing": True,
             "prefer_progress_over_safe_repetition": True,
             "opening_a_closed_exit_can_be_progress": True,
-            "do_not_sleep_unless_tired": True,
             "do_not_move_onto_known_hostile": True,
         },
     }
@@ -634,6 +646,21 @@ def main() -> int:
         feed.push(f"DO: {concise_action(choice)} — {reason}")
 
         action = choice["action"]
+        if action not in VALIDATION_DISPATCH_ALLOWLIST:
+            command_error = (
+                f"validation_dispatch_blocked: {action!r} is not in "
+                f"{sorted(VALIDATION_DISPATCH_ALLOWLIST)}"
+            )
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "action_index": action_count + 1,
+                "blocked_dispatch": action,
+                "command_error": command_error,
+            })
+            feed.push("BLOCKED: excluded validation action " + str(action))
+            print(command_error)
+            break
+
         started = time.monotonic()
         try:
             result = send_command(action, timeout=900.0, **command_kwargs(choice))
@@ -700,24 +727,38 @@ def main() -> int:
                 "after": state.get("inventory_count"),
             }
         elif action == "eat_best_food":
+            before_hunger = int(previous_state.get("hunger", 0) or 0)
+            after_hunger = int(state.get("hunger", 0) or 0)
+            before_kcal = int(previous_state.get("stored_kcal", 0) or 0)
+            after_kcal = int(state.get("stored_kcal", 0) or 0)
+            hunger_delta = before_hunger - after_hunger
+            kcal_delta = after_kcal - before_kcal
             verification = {
                 "verified": (
-                    int(state.get("hunger", 0) or 0) < int(previous_state.get("hunger", 0) or 0)
-                    or int(state.get("stored_kcal", 0) or 0) > int(previous_state.get("stored_kcal", 0) or 0)
+                    hunger_delta >= MIN_HUNGER_IMPROVEMENT
+                    or kcal_delta >= MIN_STORED_KCAL_IMPROVEMENT
                 ),
-                "evidence": "hunger_down_or_stored_kcal_up",
-                "before_hunger": previous_state.get("hunger"),
-                "after_hunger": state.get("hunger"),
-                "before_kcal": previous_state.get("stored_kcal"),
-                "after_kcal": state.get("stored_kcal"),
+                "evidence": "meaningful_hunger_down_or_stored_kcal_up",
+                "minimum_hunger_improvement": MIN_HUNGER_IMPROVEMENT,
+                "minimum_kcal_improvement": MIN_STORED_KCAL_IMPROVEMENT,
+                "hunger_delta": hunger_delta,
+                "kcal_delta": kcal_delta,
+                "before_hunger": before_hunger,
+                "after_hunger": after_hunger,
+                "before_kcal": before_kcal,
+                "after_kcal": after_kcal,
             }
         elif action == "drink_best":
+            before_thirst = int(previous_state.get("thirst", 0) or 0)
+            after_thirst = int(state.get("thirst", 0) or 0)
+            thirst_delta = before_thirst - after_thirst
             verification = {
-                "verified": int(state.get("thirst", 0) or 0) <
-                            int(previous_state.get("thirst", 0) or 0),
-                "evidence": "thirst_decrease",
-                "before": previous_state.get("thirst"),
-                "after": state.get("thirst"),
+                "verified": thirst_delta >= MIN_THIRST_IMPROVEMENT,
+                "evidence": "meaningful_thirst_decrease",
+                "minimum_thirst_improvement": MIN_THIRST_IMPROVEMENT,
+                "thirst_delta": thirst_delta,
+                "before": before_thirst,
+                "after": after_thirst,
             }
 
         if verification is not None:
