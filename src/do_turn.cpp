@@ -148,6 +148,11 @@ struct consumable_snapshot {
     int quench = 0;
 };
 
+struct inventory_snapshot {
+    std::string name;
+    double melee_value = 0.0;
+};
+
 struct state_snapshot {
     int turn = 0;
     int x = 0;
@@ -168,6 +173,8 @@ struct state_snapshot {
     std::vector<local_tile_snapshot> local_tiles;
     std::vector<creature_snapshot> creatures;
     std::vector<consumable_snapshot> consumables;
+    std::vector<inventory_snapshot> inventory_items;
+    std::string wielded_item;
 };
 
 static std::optional<fs::path> bridge_dir()
@@ -182,7 +189,7 @@ static std::optional<fs::path> bridge_dir()
     return dir;
 }
 
-static state_snapshot snapshot( const avatar &u )
+static state_snapshot snapshot( avatar &u )
 {
     map &m = get_map();
     const tripoint_bub_ms pos = u.pos_bub();
@@ -272,6 +279,20 @@ static state_snapshot snapshot( const avatar &u )
         } );
     }
 
+    const item_location wielded = u.get_wielded_item();
+    if( wielded ) {
+        state.wielded_item = wielded->tname();
+    }
+
+    int inventory_count = 0;
+    for( item_location loc : u.all_items_loc() ) {
+        if( !loc || inventory_count >= 24 ) {
+            continue;
+        }
+        state.inventory_items.push_back( { loc->tname(), u.melee_value( *loc ) } );
+        ++inventory_count;
+    }
+
     return state;
 }
 
@@ -338,6 +359,17 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
         jsout.member( "name", food.name );
         jsout.member( "nutrition", food.nutrition );
         jsout.member( "quench", food.quench );
+        jsout.end_object();
+    }
+    jsout.end_array();
+
+    jsout.member( "wielded_item", state.wielded_item );
+    jsout.member( "inventory_items" );
+    jsout.start_array();
+    for( const inventory_snapshot &inv : state.inventory_items ) {
+        jsout.start_object();
+        jsout.member( "name", inv.name );
+        jsout.member( "melee_value", inv.melee_value );
         jsout.end_object();
     }
     jsout.end_array();
@@ -446,6 +478,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
         int dx = 0;
         int dy = 0;
         int duration_minutes = 480;
+        std::string item_name;
         try {
             std::ifstream fin( command );
             TextJsonIn jsin( fin );
@@ -455,6 +488,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
             dx = jo.get_int( "dx", 0 );
             dy = jo.get_int( "dy", 0 );
             duration_minutes = jo.get_int( "duration_minutes", 480 );
+            item_name = jo.get_string( "item_name", "" );
         } catch( const std::exception &err ) {
             const state_snapshot current = snapshot( u );
             fs::remove( command, ec );
@@ -538,6 +572,96 @@ static bool wait_for_turn_action( avatar &u, map &m )
             continue;
         }
 
+        if( action == "close_adjacent" ) {
+            if( !valid_delta( dx, dy ) ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false );
+                continue;
+            }
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            const bool inside = !m.is_outside( u.pos_bub() );
+            if( !m.inbounds( target ) || !m.close_door( target, inside, true ) ) {
+                write_response( dir, command_id, action, false, "not_closable",
+                                before, before, false, false );
+                continue;
+            }
+            const bool closed = m.close_door( target, inside, false );
+            if( closed ) {
+                u.mod_moves( -to_moves<int>( 1_seconds ) );
+            }
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, closed,
+                            closed ? "closed" : "close_failed",
+                            before, after, closed, false );
+            if( closed ) {
+                return true;
+            }
+            continue;
+        }
+
+        if( action == "pickup_item" ) {
+            if( dx < -1 || dx > 1 || dy < -1 || dy > 1 ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false );
+                continue;
+            }
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            if( !m.inbounds( target ) ) {
+                write_response( dir, command_id, action, false, "out_of_bounds",
+                                before, before, false, false );
+                continue;
+            }
+
+            bool picked = false;
+            map_cursor cursor( &m, target );
+            for( item &it : m.i_at( target ) ) {
+                if( !item_name.empty() && it.tname() != item_name ) {
+                    continue;
+                }
+                item_location loc( cursor, &it );
+                item_location obtained = loc.obtain( u );
+                picked = static_cast<bool>( obtained );
+                break;
+            }
+
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, picked,
+                            picked ? "picked_up" : "item_unavailable",
+                            before, after, picked, false );
+            if( picked ) {
+                return true;
+            }
+            continue;
+        }
+
+        if( action == "wield_best_melee" ) {
+            item_location best;
+            double best_value = u.unarmed_value();
+            for( item_location loc : u.all_items_loc() ) {
+                if( !loc ) {
+                    continue;
+                }
+                const double value = u.melee_value( *loc );
+                if( value > best_value && u.can_wield( *loc ).success() ) {
+                    best_value = value;
+                    best = loc;
+                }
+            }
+
+            bool wielded_ok = false;
+            if( best ) {
+                wielded_ok = u.wield( best );
+            }
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, wielded_ok,
+                            wielded_ok ? "wielded" : "no_better_melee_item",
+                            before, after, wielded_ok, false );
+            if( wielded_ok ) {
+                return true;
+            }
+            continue;
+        }
+
         if( action == "move_one_tile" ) {
             if( !valid_delta( dx, dy ) ) {
                 write_response( dir, command_id, action, false, "invalid_delta",
@@ -560,7 +684,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
 
         write_response( dir, command_id, action, false, "unsupported_action",
                         before, before, false, false,
-                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, eat_best_food, drink_best, sleep, quicksave" );
+                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, close_adjacent, pickup_item, wield_best_melee, eat_best_food, drink_best, sleep, quicksave" );
     }
 }
 
