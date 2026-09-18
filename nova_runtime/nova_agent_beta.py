@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+import json
+import os
+import random
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib import request
+
+ROOT = Path(__file__).resolve().parent
+BRIDGE = Path(os.environ.get("NOVA_BRIDGE_DIR", ROOT / "nova-ipc"))
+LOG_DIR = ROOT / "nova-logs"
+STATE_DIR = ROOT / "nova-state"
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+RUN_MINUTES = int(os.environ.get("NOVA_RUN_MINUTES", "60"))
+MODEL_OVERRIDE = os.environ.get("NOVA_MODEL", "").strip()
+
+CARDINALS = {
+    "north": (0, -1),
+    "south": (0, 1),
+    "west": (-1, 0),
+    "east": (1, 0),
+}
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+def write_json_atomic(path: Path, obj: dict) -> None:
+    write_text_atomic(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+
+def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
+    BRIDGE.mkdir(parents=True, exist_ok=True)
+    command_path = BRIDGE / "command.json"
+    command_id = uuid.uuid4().hex
+    response_path = BRIDGE / f"response-{command_id}.json"
+    payload = {"id": command_id, "action": action, **kwargs}
+    if command_path.exists():
+        command_path.unlink()
+    if response_path.exists():
+        response_path.unlink()
+    write_json_atomic(command_path, payload)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if response_path.exists():
+            try:
+                data = json.loads(response_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.05)
+                continue
+            if data.get("id") == command_id:
+                try:
+                    response_path.unlink()
+                except OSError:
+                    pass
+                return data
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for CDDA response to {action} ({command_id})")
+
+def ollama_json(path: str, payload: dict | None = None, timeout: float = 180.0) -> dict:
+    url = OLLAMA + path
+    if payload is None:
+        req = request.Request(url, method="GET")
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    with request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def pick_model() -> str | None:
+    if MODEL_OVERRIDE:
+        return MODEL_OVERRIDE
+    try:
+        tags = ollama_json("/api/tags", timeout=5.0).get("models", [])
+    except Exception:
+        return None
+    names = [m.get("name", "") for m in tags if m.get("name")]
+    preferred = [n for n in names if "qwen" in n.lower() and "7b" in n.lower()]
+    if preferred:
+        return preferred[0]
+    qwen = [n for n in names if "qwen" in n.lower()]
+    return qwen[0] if qwen else (names[0] if names else None)
+
+def state_from_response(resp: dict) -> dict:
+    return resp.get("after") or resp.get("before") or {}
+
+def pos_tuple(state: dict) -> tuple[int, int, int]:
+    p = state.get("position") or {}
+    return (int(p.get("x", 0)), int(p.get("y", 0)), int(p.get("z", 0)))
+
+def tile_map(state: dict) -> dict[tuple[int, int], dict]:
+    out = {}
+    for t in state.get("local_tiles", []):
+        try:
+            out[(int(t["dx"]), int(t["dy"]))] = t
+        except Exception:
+            pass
+    return out
+
+def hostile_positions(state: dict) -> set[tuple[int, int]]:
+    out = set()
+    for c in state.get("nearby_creatures", []):
+        if str(c.get("attitude", "")).lower() == "hostile":
+            try:
+                out.add((int(c["dx"]), int(c["dy"])))
+            except Exception:
+                pass
+    return out
+
+@dataclass
+class WorldModel:
+    visits: dict[tuple[int, int, int], int] = field(default_factory=dict)
+    known_tiles: dict[tuple[int, int, int], dict] = field(default_factory=dict)
+    recent_positions: deque = field(default_factory=lambda: deque(maxlen=10))
+    recent_actions: deque = field(default_factory=lambda: deque(maxlen=12))
+    seen_hostiles: dict[str, dict] = field(default_factory=dict)
+    active_intention: str = ""
+    intention_age: int = 0
+    progress_epoch: int = 0
+
+    def observe(self, state: dict) -> None:
+        p = pos_tuple(state)
+        self.visits[p] = self.visits.get(p, 0) + 1
+        self.recent_positions.append(p)
+        px, py, pz = p
+        for t in state.get("local_tiles", []):
+            try:
+                gx = px + int(t["dx"])
+                gy = py + int(t["dy"])
+                self.known_tiles[(gx, gy, pz)] = {
+                    "terrain": t.get("terrain", ""),
+                    "passable": bool(t.get("passable")),
+                    "openable": bool(t.get("openable")),
+                    "items": list(t.get("items") or []),
+                }
+            except Exception:
+                pass
+        for c in state.get("nearby_creatures", []):
+            name = str(c.get("name", "creature"))
+            self.seen_hostiles[name] = {
+                "kind": c.get("kind"),
+                "attitude": c.get("attitude"),
+                "dx": c.get("dx"), "dy": c.get("dy"),
+            }
+
+    def record_action(self, choice: dict, outcome: str) -> None:
+        self.recent_actions.append({
+            "action": choice.get("action"),
+            "dx": choice.get("dx"),
+            "dy": choice.get("dy"),
+            "outcome": outcome,
+        })
+        self.intention_age += 1
+
+    def visit_count_target(self, state: dict, dx: int, dy: int) -> int:
+        x, y, z = pos_tuple(state)
+        return self.visits.get((x + dx, y + dy, z), 0)
+
+    def is_immediate_backtrack(self, state: dict, dx: int, dy: int) -> bool:
+        if len(self.recent_positions) < 2:
+            return False
+        x, y, z = pos_tuple(state)
+        return (x + dx, y + dy, z) == self.recent_positions[-2]
+
+    def looping(self) -> bool:
+        r = list(self.recent_positions)
+        if len(r) < 6:
+            return False
+        # A-B-A-B or repeated tiny-area pacing.
+        if r[-1] == r[-3] == r[-5] and r[-2] == r[-4]:
+            return True
+        return len(set(r[-8:])) <= 3 and len(r[-8:]) >= 6
+
+class ThoughtFeed:
+    def __init__(self) -> None:
+        self.lines = deque(maxlen=3)
+        self.path = BRIDGE / "nova-thoughts.txt"
+
+    def push(self, text: str) -> None:
+        clean = " ".join(str(text).replace("\n", " ").split())
+        if len(clean) > 140:
+            clean = clean[:137] + "..."
+        self.lines.append(clean)
+        write_text_atomic(self.path, "\n".join(self.lines) + "\n")
+
+def situation_summary(state: dict, wm: WorldModel) -> dict:
+    tiles = tile_map(state)
+    doors = []
+    open_moves = []
+    for name, (dx, dy) in CARDINALS.items():
+        t = tiles.get((dx, dy))
+        if not t:
+            continue
+        if t.get("openable"):
+            doors.append({"direction": name, "terrain": t.get("terrain", "")})
+        if t.get("passable"):
+            open_moves.append(name)
+
+    hostiles = []
+    for c in state.get("nearby_creatures", []):
+        if str(c.get("attitude", "")).lower() == "hostile":
+            hostiles.append({
+                "name": c.get("name", "hostile"),
+                "dx": c.get("dx"), "dy": c.get("dy")
+            })
+
+    visible_items = []
+    for t in state.get("local_tiles", []):
+        if t.get("items"):
+            visible_items.append({
+                "dx": t.get("dx"), "dy": t.get("dy"),
+                "terrain": t.get("terrain", ""),
+                "items": t.get("items")[:3],
+            })
+
+    return {
+        "indoors": bool(state.get("indoors")),
+        "adjacent_closed_doors": doors,
+        "open_directions": open_moves,
+        "visible_items": visible_items[:8],
+        "nearby_hostiles": hostiles[:8],
+        "current_tile_visits": wm.visits.get(pos_tuple(state), 0),
+        "loop_detected": wm.looping(),
+        "known_positions": len(wm.visits),
+        "known_tiles": len(wm.known_tiles),
+    }
+
+def describe_situation(s: dict) -> str:
+    parts = []
+    parts.append("indoors" if s["indoors"] else "outdoors")
+    if s["adjacent_closed_doors"]:
+        parts.append("closed door " + "/".join(d["direction"] for d in s["adjacent_closed_doors"]))
+    if s["nearby_hostiles"]:
+        h = s["nearby_hostiles"][0]
+        parts.append(f"hostile {h['name']} nearby")
+    if s["visible_items"]:
+        names = []
+        for group in s["visible_items"][:2]:
+            names.extend(group.get("items", [])[:2])
+        if names:
+            parts.append("items: " + ", ".join(names[:3]))
+    if s["loop_detected"]:
+        parts.append("repeating path")
+    return "; ".join(parts)
+
+def available_actions(state: dict, wm: WorldModel) -> list[dict]:
+    actions = []
+    tiles = tile_map(state)
+    hostiles = hostile_positions(state)
+    loop = wm.looping()
+
+    for name, (dx, dy) in CARDINALS.items():
+        t = tiles.get((dx, dy))
+        if not t:
+            continue
+
+        visits = wm.visit_count_target(state, dx, dy)
+        backtrack = wm.is_immediate_backtrack(state, dx, dy)
+
+        if t.get("openable"):
+            # Opening a closed boundary is strong progress when indoors or looping.
+            score = 0.78 + (0.12 if state.get("indoors") else 0.0) + (0.08 if loop else 0.0)
+            actions.append({
+                "action": "open_adjacent", "dx": dx, "dy": dy,
+                "label": f"open {name} {t.get('terrain','door')}",
+                "controller_score": min(1.0, score),
+                "progress": "reveals/accesses a new boundary",
+            })
+
+        if t.get("passable"):
+            novelty = 1.0 / (1.0 + visits)
+            score = 0.58 + 0.30 * novelty
+            if backtrack:
+                score -= 0.32
+            if (dx, dy) in hostiles:
+                score -= 0.65
+            if loop and visits > 0:
+                score -= 0.18
+            actions.append({
+                "action": "move_one_tile", "dx": dx, "dy": dy,
+                "label": f"move {name}",
+                "terrain": t.get("terrain", ""),
+                "visits_target": visits,
+                "immediate_backtrack": backtrack,
+                "hostile_on_tile": (dx, dy) in hostiles,
+                "controller_score": max(0.0, min(1.0, score)),
+                "progress": "new position" if visits == 0 else "known position",
+            })
+
+    consumables = state.get("inventory_consumables", [])
+    if any(int(x.get("nutrition", 0) or 0) > 0 for x in consumables):
+        actions.append({
+            "action": "eat_best_food",
+            "label": "eat the best safe carried food",
+            "controller_score": 0.35,
+        })
+    if any(int(x.get("quench", 0) or 0) > 0 for x in consumables):
+        actions.append({
+            "action": "drink_best",
+            "label": "drink the best safe carried drink",
+            "controller_score": 0.35,
+        })
+
+    sleepy = int(state.get("sleepiness", 0) or 0)
+    # Do not even show sleep to Qwen unless the character is actually tired.
+    if sleepy >= 191:
+        actions.append({
+            "action": "sleep", "duration_minutes": 480,
+            "label": "try to sleep",
+            "controller_score": min(1.0, 0.45 + max(0, sleepy - 191) / 600.0),
+        })
+
+    stamina = int(state.get("stamina", 0) or 0)
+    stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+    if stamina / stamina_max < 0.7 or not actions:
+        actions.append({
+            "action": "wait_one_turn",
+            "label": "pause briefly",
+            "controller_score": 0.2 if stamina / stamina_max >= 0.25 else 0.8,
+        })
+
+    return actions
+
+def deterministic_safety(state: dict, actions: list[dict]):
+    def find(name: str):
+        return next((a for a in actions if a.get("action") == name), None)
+    thirst = int(state.get("thirst", 0) or 0)
+    hunger = int(state.get("hunger", 0) or 0)
+    sleepy = int(state.get("sleepiness", 0) or 0)
+    stamina = int(state.get("stamina", 0) or 0)
+    stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+
+    if thirst > 80 and find("drink_best"):
+        return find("drink_best"), f"urgent thirst ({thirst})"
+    if hunger > 100 and find("eat_best_food"):
+        return find("eat_best_food"), f"urgent hunger ({hunger})"
+    if sleepy >= 383 and find("sleep"):
+        return find("sleep"), f"dead tired ({sleepy})"
+    if stamina / stamina_max < 0.25 and find("wait_one_turn"):
+        return find("wait_one_turn"), f"very low stamina ({stamina}/{stamina_max})"
+    return None
+
+def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
+    sit = situation_summary(state, wm)
+    return {
+        "situation": sit,
+        "needs": {k: state.get(k) for k in (
+            "hunger", "thirst", "sleepiness", "stamina", "stamina_max",
+            "pain", "morale", "stored_kcal", "healthy_kcal"
+        )},
+        "position": state.get("position"),
+        "activity": state.get("activity"),
+        "active_intention": wm.active_intention or None,
+        "intention_age_actions": wm.intention_age,
+        "allowed_actions": actions,
+        "recent_actions": list(wm.recent_actions)[-8:],
+        "recent_positions": list(wm.recent_positions)[-8:],
+        "carried_consumables": state.get("inventory_consumables", []),
+        "rules": {
+            "avoid_repeated_pacing": True,
+            "prefer_progress_over_safe_repetition": True,
+            "opening_a_closed_exit_can_be_progress": True,
+            "do_not_sleep_unless_tired": True,
+            "do_not_move_onto_known_hostile": True,
+        },
+    }
+
+def normalize_choice(raw: dict, allowed: list[dict]):
+    action = raw.get("action")
+    if not isinstance(action, str):
+        return None
+    for candidate in allowed:
+        if candidate.get("action") != action:
+            continue
+        if action in {"move_one_tile", "open_adjacent"}:
+            try:
+                dx = int(raw.get("dx"))
+                dy = int(raw.get("dy"))
+            except Exception:
+                continue
+            if dx != candidate.get("dx") or dy != candidate.get("dy"):
+                continue
+        out = dict(candidate)
+        out["reason"] = str(raw.get("reason", ""))[:300]
+        try:
+            out["qwen_score"] = max(0.0, min(1.0, float(raw.get("score", 0.5))))
+        except Exception:
+            out["qwen_score"] = 0.5
+        if action == "sleep" and "duration_minutes" in raw:
+            try:
+                out["duration_minutes"] = max(10, min(720, int(raw["duration_minutes"])))
+            except Exception:
+                pass
+        return out
+    return None
+
+def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict],
+                    replan: bool) -> tuple[list[dict], str]:
+    world = compact_world(state, wm, actions)
+    instruction = (
+        "You are Nova, a persistent survivor inhabiting Cataclysm: Dark Days Ahead. "
+        "Reason like a competent person with continuity, not a stateless movement bot. "
+        "Use the situation summary, remembered recent positions/actions, and active intention. "
+        "A safe action is not automatically useful: prefer actions that make progress. "
+        "Repeated backtracking and pacing are bad unless there is a concrete reason. "
+        "A closed door while indoors may be an exit or access to unexplored space. "
+        "Visible useful objects matter, even when the current capability set cannot pick them up yet. "
+        "Never invent an action that is not in allowed_actions. "
+        "Return concise JSON only; do not narrate hidden chain-of-thought. "
+    )
+    if replan:
+        instruction += (
+            "Set intention to one short practical goal for the next several actions. "
+            "It should describe what you are trying to accomplish, not merely 'explore cautiously'. "
+        )
+    else:
+        instruction += (
+            "Keep serving active_intention unless safety or new evidence makes it clearly obsolete. "
+            "Repeat the active intention unchanged in the intention field. "
+        )
+    instruction += (
+        'Schema: {"intention":"short goal","choices":['
+        '{"action":"exact action","dx":0,"dy":0,"duration_minutes":480,'
+        '"score":0.0,"reason":"one short evidence-grounded reason"}]}. '
+        "Return up to 3 choices."
+    )
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": json.dumps(world, separators=(",", ":"))},
+        ],
+        "options": {"temperature": 0.25},
+    }
+    data = ollama_json("/api/chat", payload, timeout=180.0)
+    parsed = json.loads(data.get("message", {}).get("content", "{}"))
+    intention = " ".join(str(parsed.get("intention", "")).split())[:180]
+    choices = []
+    for raw in parsed.get("choices", [])[:3]:
+        if isinstance(raw, dict):
+            valid = normalize_choice(raw, actions)
+            if valid:
+                # Hybrid executive score: Qwen judgment + grounded progress utility.
+                qs = float(valid.get("qwen_score", 0.5))
+                cs = float(valid.get("controller_score", 0.5))
+                valid["combined_score"] = 0.65 * qs + 0.35 * cs
+                choices.append(valid)
+    return choices, intention
+
+def choose_with_variation(choices: list[dict]):
+    if not choices:
+        return None
+    choices = sorted(choices, key=lambda x: float(x.get("combined_score", 0.0)), reverse=True)
+    top = float(choices[0].get("combined_score", 0.0))
+    close = [c for c in choices if float(c.get("combined_score", 0.0)) >= top - 0.08]
+    weights = [max(0.02, float(c.get("combined_score", 0.05))) for c in close]
+    return random.choices(close, weights=weights, k=1)[0]
+
+def fallback_choice(state: dict, wm: WorldModel, actions: list[dict]):
+    # Highest grounded progress score; not random pacing.
+    sane = [a for a in actions if not a.get("hostile_on_tile")]
+    if not sane:
+        sane = actions
+    choice = max(sane, key=lambda a: float(a.get("controller_score", 0.0)))
+    return choice, "controller fallback: highest grounded progress"
+
+def should_replan(wm: WorldModel, situation: dict) -> bool:
+    if not wm.active_intention:
+        return True
+    if wm.intention_age >= 6:
+        return True
+    if situation.get("loop_detected"):
+        return True
+    return False
+
+def concise_action(choice: dict) -> str:
+    return choice.get("label") or choice.get("action", "act")
+
+def append_log(path: Path, record: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+def command_kwargs(choice: dict) -> dict:
+    return {k: choice[k] for k in ("dx", "dy", "duration_minutes") if k in choice}
+
+def main() -> int:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    BRIDGE.mkdir(parents=True, exist_ok=True)
+
+    model = pick_model()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"nova-cdda-cognition-{stamp}.jsonl"
+    wm = WorldModel()
+    feed = ThoughtFeed()
+
+    print("NOVA CDDA COGNITION + UI BETA")
+    print(f"Run target: {RUN_MINUTES} minutes")
+    print(f"Ollama model: {model or 'NOT FOUND - grounded controller fallback'}")
+    print(f"Log: {log_path}")
+    print()
+
+    feed.push("NOVA: waiting for the world state.")
+
+    try:
+        obs = send_command("observe", timeout=30.0)
+    except Exception as exc:
+        print(f"Cannot reach CDDA bridge: {exc}")
+        feed.push("ERROR: cannot reach CDDA bridge.")
+        return 2
+
+    state = state_from_response(obs)
+    wm.observe(state)
+    deadline = time.monotonic() + RUN_MINUTES * 60
+    action_count = 0
+
+    while time.monotonic() < deadline:
+        sit = situation_summary(state, wm)
+        actions = available_actions(state, wm)
+        safety = deterministic_safety(state, actions)
+        model_error = None
+        replan = should_replan(wm, sit)
+
+        feed.push("SEE: " + describe_situation(sit))
+
+        if safety:
+            choice, reason = safety
+            intention = wm.active_intention or "stay alive and stabilize immediate needs"
+            feed.push("INTENT: " + intention)
+        else:
+            choice = None
+            reason = ""
+            intention = wm.active_intention
+
+            if model:
+                try:
+                    options, proposed_intention = qwen_deliberate(model, state, wm, actions, replan)
+                    if replan and proposed_intention:
+                        wm.active_intention = proposed_intention
+                        wm.intention_age = 0
+                    elif not wm.active_intention and proposed_intention:
+                        wm.active_intention = proposed_intention
+                    intention = wm.active_intention
+                    choice = choose_with_variation(options)
+                    if choice:
+                        reason = choice.get("reason") or "Qwen selected this as progress toward the intention"
+                except Exception as exc:
+                    model_error = repr(exc)
+
+            if not choice:
+                choice, reason = fallback_choice(state, wm, actions)
+                if not wm.active_intention:
+                    wm.active_intention = "expand known territory without repeating the same path"
+                intention = wm.active_intention
+
+            feed.push("INTENT: " + (intention or "make grounded progress"))
+
+        feed.push(f"DO: {concise_action(choice)} — {reason}")
+
+        action = choice["action"]
+        started = time.monotonic()
+        try:
+            result = send_command(action, timeout=900.0, **command_kwargs(choice))
+            command_error = None
+        except Exception as exc:
+            result = None
+            command_error = repr(exc)
+
+        action_count += 1
+        outcome = result.get("outcome") if result else "command_error"
+
+        if result:
+            feed.push(f"RESULT: {outcome}.")
+        else:
+            feed.push("ERROR: action did not return a result.")
+
+        record = {
+            "wall_time": utc_now(),
+            "action_index": action_count,
+            "model": model,
+            "situation": sit,
+            "active_intention": wm.active_intention,
+            "replanned": replan,
+            "selected": choice,
+            "reason": reason,
+            "model_error": model_error,
+            "command_error": command_error,
+            "state_before": state,
+            "result": result,
+            "latency_seconds": round(time.monotonic() - started, 3),
+            "world_model": {
+                "visited_positions": len(wm.visits),
+                "known_tiles": len(wm.known_tiles),
+                "loop_detected": wm.looping(),
+            },
+        }
+        append_log(log_path, record)
+
+        if command_error:
+            print(f"[{action_count}] {action}: COMMAND ERROR {command_error}")
+            break
+
+        print(f"[{action_count}] {action}: {outcome} | goal={wm.active_intention!r} | {reason[:90]}")
+        wm.record_action(choice, outcome)
+
+        try:
+            obs = send_command("observe", timeout=900.0)
+            state = state_from_response(obs)
+            wm.observe(state)
+        except Exception as exc:
+            append_log(log_path, {"wall_time": utc_now(), "observe_error": repr(exc)})
+            feed.push("ERROR: lost world observation.")
+            print(f"Observe failed: {exc}")
+            break
+
+        if action_count % 25 == 0:
+            try:
+                save_result = send_command("quicksave", timeout=120.0)
+                append_log(log_path, {"wall_time": utc_now(), "checkpoint": save_result})
+                feed.push("CHECKPOINT: game saved.")
+            except Exception as exc:
+                append_log(log_path, {"wall_time": utc_now(), "quicksave_error": repr(exc)})
+
+    feed.push(f"SESSION: finished after {action_count} actions.")
+    print()
+    print(f"Run finished after {action_count} actions.")
+    print(f"Log saved to: {log_path}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
