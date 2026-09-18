@@ -19,10 +19,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Apply Nova bridge patch
-        shell: pwsh
-        run: git apply nova/nova-cdda-observe-move-spike.patch
-
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
 
