@@ -50,6 +50,7 @@
 #include "item.h"
 #include "item_location.h"
 #include "item_wakeup.h"
+#include "itype.h"
 #include "json.h"
 #include "magic_enchantment.h"
 #include "map.h"
