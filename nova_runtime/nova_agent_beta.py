@@ -234,6 +234,7 @@ def situation_summary(state: dict, wm: WorldModel) -> dict:
                 "dx": t.get("dx"), "dy": t.get("dy"),
                 "terrain": t.get("terrain", ""),
                 "items": t.get("items")[:3],
+                "item_details": (t.get("item_details") or [])[:3],
             })
 
     return {
@@ -271,6 +272,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     tiles = tile_map(state)
     hostiles = hostile_positions(state)
     loop = wm.looping()
+    nearby_hostiles = list(hostiles)
 
     for name, (dx, dy) in CARDINALS.items():
         t = tiles.get((dx, dy))
@@ -289,7 +291,6 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 label = f"open {name} curtains"
                 progress = "improves visibility but is not an exit"
             else:
-                # A closed door/boundary is strong progress when indoors or looping.
                 score = 0.78 + (0.12 if state.get("indoors") else 0.0) + (0.08 if loop else 0.0)
                 label = f"open {name} {terrain or 'door'}"
                 progress = "reveals/accesses a new boundary"
@@ -300,42 +301,118 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "progress": progress,
             })
 
+        if t.get("closable"):
+            actions.append({
+                "action": "close_adjacent", "dx": dx, "dy": dy,
+                "label": f"close {name} {t.get('terrain','door')}",
+                "controller_score": 0.32 + (0.18 if nearby_hostiles else 0.0),
+                "progress": "secures a boundary",
+            })
+
         if t.get("passable"):
             novelty = 1.0 / (1.0 + visits)
             score = 0.58 + 0.30 * novelty
             if backtrack:
                 score -= 0.32
-            if (dx, dy) in hostiles:
-                score -= 0.65
+
+            hostile_on_tile = (dx, dy) in hostiles
+            if hostile_on_tile:
+                score -= 0.58
+                label = f"attack/advance {name} into hostile"
+                progress = "engages adjacent hostile"
+            else:
+                label = f"move {name}"
+                progress = "new position" if visits == 0 else "known position"
+
+                # Prefer movement that creates space from nearby hostiles.
+                if nearby_hostiles:
+                    before_d = min(max(abs(hx), abs(hy)) for hx, hy in nearby_hostiles)
+                    after_d = min(max(abs(hx - dx), abs(hy - dy)) for hx, hy in nearby_hostiles)
+                    if after_d > before_d:
+                        score += 0.18
+                        progress = "creates distance from hostile"
+                    elif after_d < before_d:
+                        score -= 0.24
+
             if loop and visits > 0:
                 score -= 0.18
             actions.append({
                 "action": "move_one_tile", "dx": dx, "dy": dy,
-                "label": f"move {name}",
+                "label": label,
                 "terrain": t.get("terrain", ""),
                 "visits_target": visits,
                 "immediate_backtrack": backtrack,
-                "hostile_on_tile": (dx, dy) in hostiles,
+                "hostile_on_tile": hostile_on_tile,
                 "controller_score": max(0.0, min(1.0, score)),
-                "progress": "new position" if visits == 0 else "known position",
+                "progress": progress,
             })
+
+    # Real pickup actions for items on the current or adjacent tiles.
+    pickup_count = 0
+    for (dx, dy), t in tiles.items():
+        if abs(dx) > 1 or abs(dy) > 1:
+            continue
+        details = t.get("item_details") or []
+        if not details:
+            details = [{"name": name, "nutrition": 0, "quench": 0, "melee_value": 0}
+                       for name in (t.get("items") or [])]
+        for detail in details:
+            if pickup_count >= 10:
+                break
+            name = str(detail.get("name", "")).strip()
+            if not name:
+                continue
+            nutrition = int(detail.get("nutrition", 0) or 0)
+            quench = int(detail.get("quench", 0) or 0)
+            melee_value = float(detail.get("melee_value", 0) or 0)
+            score = 0.44
+            utility = []
+            if nutrition > 0:
+                score += 0.28
+                utility.append(f"food {nutrition}")
+            if quench > 0:
+                score += 0.28
+                utility.append(f"drink {quench}")
+            if melee_value > 3.0:
+                score += min(0.20, melee_value / 100.0)
+                utility.append(f"melee {melee_value:.1f}")
+            actions.append({
+                "action": "pickup_item", "dx": dx, "dy": dy, "item_name": name,
+                "label": f"pick up {name}",
+                "controller_score": min(1.0, score),
+                "progress": "acquires usable resource" if utility else "acquires nearby item",
+                "item_utility": utility,
+            })
+            pickup_count += 1
 
     consumables = state.get("inventory_consumables", [])
     if any(int(x.get("nutrition", 0) or 0) > 0 for x in consumables):
+        hunger = int(state.get("hunger", 0) or 0)
         actions.append({
             "action": "eat_best_food",
             "label": "eat the best safe carried food",
-            "controller_score": 0.35,
+            "controller_score": min(1.0, 0.30 + max(0, hunger) / 220.0),
         })
     if any(int(x.get("quench", 0) or 0) > 0 for x in consumables):
+        thirst = int(state.get("thirst", 0) or 0)
         actions.append({
             "action": "drink_best",
             "label": "drink the best safe carried drink",
-            "controller_score": 0.35,
+            "controller_score": min(1.0, 0.30 + max(0, thirst) / 180.0),
         })
 
+    inventory_items = state.get("inventory_items") or []
+    if inventory_items:
+        best_melee = max(float(x.get("melee_value", 0) or 0) for x in inventory_items)
+        if best_melee > 3.0:
+            actions.append({
+                "action": "wield_best_melee",
+                "label": "equip the best carried melee item",
+                "controller_score": min(0.85, 0.42 + best_melee / 100.0 + (0.15 if nearby_hostiles else 0.0)),
+                "progress": "improves readiness for threats",
+            })
+
     sleepy = int(state.get("sleepiness", 0) or 0)
-    # Do not even show sleep to Qwen unless the character is actually tired.
     if sleepy >= 191:
         actions.append({
             "action": "sleep", "duration_minutes": 480,
@@ -389,6 +466,8 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         "recent_actions": list(wm.recent_actions)[-8:],
         "recent_positions": list(wm.recent_positions)[-8:],
         "carried_consumables": state.get("inventory_consumables", []),
+        "wielded_item": state.get("wielded_item", ""),
+        "inventory_items": state.get("inventory_items", []),
         "rules": {
             "avoid_repeated_pacing": True,
             "prefer_progress_over_safe_repetition": True,
@@ -405,13 +484,16 @@ def normalize_choice(raw: dict, allowed: list[dict]):
     for candidate in allowed:
         if candidate.get("action") != action:
             continue
-        if action in {"move_one_tile", "open_adjacent"}:
+        if action in {"move_one_tile", "open_adjacent", "close_adjacent", "pickup_item"}:
             try:
                 dx = int(raw.get("dx"))
                 dy = int(raw.get("dy"))
             except Exception:
                 continue
             if dx != candidate.get("dx") or dy != candidate.get("dy"):
+                continue
+        if action == "pickup_item":
+            if str(raw.get("item_name", "")) != str(candidate.get("item_name", "")):
                 continue
         out = dict(candidate)
         out["reason"] = str(raw.get("reason", ""))[:300]
@@ -437,9 +519,9 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         "A safe action is not automatically useful: prefer actions that make progress. "
         "Repeated backtracking and pacing are bad unless there is a concrete reason. "
         "A closed door while indoors may be an exit or access to unexplored space. "
-        "Visible useful objects matter, but an active intention must be achievable with allowed_actions now. "
-        "If food or supplies are visible but there is no pickup/use action available, remember them as future resources "
-        "instead of choosing 'gather supplies' as the current intention. "
+        "Visible useful objects matter. If pickup_item is available, you can actually acquire them now. "
+        "If wield_best_melee is available, you can improve combat readiness. "
+        "An active intention must be achievable with allowed_actions now. "
         "Never invent an action that is not in allowed_actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
     )
@@ -455,7 +537,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         )
     instruction += (
         'Schema: {"intention":"short goal","choices":['
-        '{"action":"exact action","dx":0,"dy":0,"duration_minutes":480,'
+        '{"action":"exact action","dx":0,"dy":0,"item_name":"exact visible item name","duration_minutes":480,'
         '"score":0.0,"reason":"one short evidence-grounded reason"}]}. '
         "Return up to 3 choices."
     )
@@ -484,12 +566,12 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
                 cs = float(valid.get("controller_score", 0.5))
                 valid["combined_score"] = 0.65 * qs + 0.35 * cs
                 choices.append(valid)
-                represented.add((valid.get("action"), valid.get("dx"), valid.get("dy")))
+                represented.add((valid.get("action"), valid.get("dx"), valid.get("dy"), valid.get("item_name")))
 
     # Do not let Qwen accidentally hide a highly meaningful grounded option.
     # Unmentioned legal actions remain candidates with a modest model prior.
     for candidate in actions:
-        key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"))
+        key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"), candidate.get("item_name"))
         if key in represented:
             continue
         extra = dict(candidate)
@@ -535,7 +617,7 @@ def append_log(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 def command_kwargs(choice: dict) -> dict:
-    return {k: choice[k] for k in ("dx", "dy", "duration_minutes") if k in choice}
+    return {k: choice[k] for k in ("dx", "dy", "item_name", "duration_minutes") if k in choice}
 
 def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
