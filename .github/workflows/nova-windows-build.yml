@@ -1,0 +1,56 @@
+name: Nova CDDA Windows bridge build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - nova-bridge-spike
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      BACKTRACE: 1
+      CDDA_RELEASE_BUILD: 1
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\.github\vcpkg_triplets
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Apply Nova bridge patch
+        shell: pwsh
+        run: git apply nova/nova-cdda-observe-move-spike.patch
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Install CMake 3.31.6
+        uses: lukka/get-cmake@f176ccd3f28bda569c43aae4894f06b2435a3375
+        with:
+          cmakeVersion: 3.31.6
+
+      - name: Install pinned vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ runner.workspace }}/b/vcpkg'
+          vcpkgGitCommitId: 'f6672d8e480ccdecddfad3fd1b838ba369ffe6cd'
+
+      - name: Integrate vcpkg
+        shell: pwsh
+        run: vcpkg integrate install --vcpkg-root '${{ runner.workspace }}\b\vcpkg'
+
+      - name: Build Windows x64 tiles executable
+        shell: pwsh
+        run: >-
+          msbuild -m -p:Configuration=Release -p:Platform=x64
+          "-target:Cataclysm-vcpkg-static"
+          msvc-full-features\Cataclysm-vcpkg-static.sln
+
+      - name: Upload patched executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nova-cdda-bridge-windows-x64
+          path: cataclysm-tiles.exe
+          if-no-files-found: error
