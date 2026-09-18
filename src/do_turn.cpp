@@ -122,7 +122,7 @@ namespace nova_bridge
 
 namespace fs = std::filesystem;
 
-static constexpr const char *protocol_version = "nova-cdda-bridge-v2-survival-alpha";
+static constexpr const char *protocol_version = "nova-cdda-bridge-v3-cognition-beta";
 
 struct local_tile_snapshot {
     int dx = 0;
@@ -186,12 +186,15 @@ static state_snapshot snapshot( const avatar &u )
 {
     map &m = get_map();
     const tripoint_bub_ms pos = u.pos_bub();
+    const tripoint_abs_ms pos_abs = u.pos_abs();
 
     state_snapshot state;
     state.turn = to_turns<int>( calendar::turn - calendar::turn_zero );
-    state.x = pos.x();
-    state.y = pos.y();
-    state.z = pos.z();
+    // Persistent cognition must use global map-square coordinates.  Bubble
+    // coordinates can jump when CDDA recenters the reality bubble.
+    state.x = pos_abs.x();
+    state.y = pos_abs.y();
+    state.z = pos_abs.z();
     state.moves = u.get_moves();
     state.hunger = u.get_hunger();
     state.thirst = u.get_thirst();
