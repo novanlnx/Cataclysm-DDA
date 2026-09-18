@@ -163,6 +163,7 @@ struct state_snapshot {
     int healthy_kcal = 0;
     int pain = 0;
     int morale = 0;
+    bool indoors = false;
     std::string activity;
     std::vector<local_tile_snapshot> local_tiles;
     std::vector<creature_snapshot> creatures;
@@ -201,6 +202,7 @@ static state_snapshot snapshot( const avatar &u )
     state.healthy_kcal = u.get_healthy_kcal();
     state.pain = u.get_pain();
     state.morale = u.get_morale_level();
+    state.indoors = !m.is_outside( pos );
     state.activity = u.activity ? u.activity.id().str() : std::string();
 
     const bool inside = !m.is_outside( pos );
@@ -290,6 +292,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.member( "healthy_kcal", state.healthy_kcal );
     jsout.member( "pain", state.pain );
     jsout.member( "morale", state.morale );
+    jsout.member( "indoors", state.indoors );
     jsout.member( "activity", state.activity );
 
     jsout.member( "local_tiles" );
