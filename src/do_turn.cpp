@@ -124,6 +124,12 @@ namespace fs = std::filesystem;
 
 static constexpr const char *protocol_version = "nova-cdda-bridge-v3-cognition-beta";
 
+struct ground_consumable_snapshot {
+    std::string name;
+    int nutrition = 0;
+    int quench = 0;
+};
+
 struct local_tile_snapshot {
     int dx = 0;
     int dy = 0;
@@ -132,6 +138,7 @@ struct local_tile_snapshot {
     bool openable = false;
     bool closable = false;
     std::vector<std::string> items;
+    std::vector<ground_consumable_snapshot> consumables;
 };
 
 struct creature_snapshot {
@@ -168,6 +175,7 @@ struct state_snapshot {
     std::vector<local_tile_snapshot> local_tiles;
     std::vector<creature_snapshot> creatures;
     std::vector<consumable_snapshot> consumables;
+    int inventory_count = 0;
 };
 
 static std::optional<fs::path> bridge_dir()
@@ -182,7 +190,7 @@ static std::optional<fs::path> bridge_dir()
     return dir;
 }
 
-static state_snapshot snapshot( const avatar &u )
+static state_snapshot snapshot( avatar &u )
 {
     map &m = get_map();
     const tripoint_bub_ms pos = u.pos_bub();
@@ -228,6 +236,11 @@ static state_snapshot snapshot( const avatar &u )
                     break;
                 }
                 tile.items.push_back( it.tname() );
+                if( it.get_comestible() ) {
+                    tile.consumables.push_back( {
+                        it.tname(), u.nutrition_for( it ), it.get_comestible()->quench
+                    } );
+                }
                 ++item_count;
             }
             state.local_tiles.push_back( std::move( tile ) );
@@ -271,6 +284,7 @@ static state_snapshot snapshot( const avatar &u )
             loc->get_comestible()->quench
         } );
     }
+    state.inventory_count = static_cast<int>( u.all_items_loc().size() );
 
     return state;
 }
@@ -314,6 +328,16 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
             jsout.write( name );
         }
         jsout.end_array();
+        jsout.member( "ground_consumables" );
+        jsout.start_array();
+        for( const ground_consumable_snapshot &food : tile.consumables ) {
+            jsout.start_object();
+            jsout.member( "name", food.name );
+            jsout.member( "nutrition", food.nutrition );
+            jsout.member( "quench", food.quench );
+            jsout.end_object();
+        }
+        jsout.end_array();
         jsout.end_object();
     }
     jsout.end_array();
@@ -331,6 +355,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     }
     jsout.end_array();
 
+    jsout.member( "inventory_count", state.inventory_count );
     jsout.member( "inventory_consumables" );
     jsout.start_array();
     for( const consumable_snapshot &food : state.consumables ) {
@@ -446,6 +471,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
         int dx = 0;
         int dy = 0;
         int duration_minutes = 480;
+        std::string item_name;
         try {
             std::ifstream fin( command );
             TextJsonIn jsin( fin );
@@ -455,6 +481,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
             dx = jo.get_int( "dx", 0 );
             dy = jo.get_int( "dy", 0 );
             duration_minutes = jo.get_int( "duration_minutes", 480 );
+            item_name = jo.get_string( "item_name", "" );
         } catch( const std::exception &err ) {
             const state_snapshot current = snapshot( u );
             fs::remove( command, ec );
@@ -511,6 +538,47 @@ static bool wait_for_turn_action( avatar &u, map &m )
             return true;
         }
 
+        if( action == "pickup_consumable" ) {
+            if( dx < -1 || dx > 1 || dy < -1 || dy > 1 ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false );
+                continue;
+            }
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            if( !m.inbounds( target ) ) {
+                write_response( dir, command_id, action, false, "out_of_bounds",
+                                before, before, false, false );
+                continue;
+            }
+
+            bool obtained = false;
+            map_cursor cursor( &m, target );
+            for( item &it : m.i_at( target ) ) {
+                if( !it.get_comestible() ) {
+                    continue;
+                }
+                if( !item_name.empty() && it.tname() != item_name ) {
+                    continue;
+                }
+                item_location loc( cursor, &it );
+                obtained = static_cast<bool>( loc.obtain( u ) );
+                break;
+            }
+
+            const state_snapshot after = snapshot( u );
+            const bool inventory_changed = after.inventory_count > before.inventory_count ||
+                                           after.consumables.size() > before.consumables.size();
+            const bool verified = obtained && inventory_changed;
+            write_response( dir, command_id, action, verified,
+                            verified ? "pickup_verified" :
+                            obtained ? "pickup_unverified" : "pickup_failed",
+                            before, after, obtained, false );
+            if( obtained ) {
+                return true;
+            }
+            continue;
+        }
+
         if( action == "open_adjacent" ) {
             if( !valid_delta( dx, dy ) ) {
                 write_response( dir, command_id, action, false, "invalid_delta",
@@ -560,7 +628,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
 
         write_response( dir, command_id, action, false, "unsupported_action",
                         before, before, false, false,
-                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, eat_best_food, drink_best, sleep, quicksave" );
+                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, pickup_consumable, eat_best_food, drink_best, sleep, quicksave" );
     }
 }
 
