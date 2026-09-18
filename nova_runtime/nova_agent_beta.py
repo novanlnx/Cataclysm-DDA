@@ -448,6 +448,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     parsed = json.loads(data.get("message", {}).get("content", "{}"))
     intention = " ".join(str(parsed.get("intention", "")).split())[:180]
     choices = []
+    represented = set()
     for raw in parsed.get("choices", [])[:3]:
         if isinstance(raw, dict):
             valid = normalize_choice(raw, actions)
@@ -457,6 +458,21 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
                 cs = float(valid.get("controller_score", 0.5))
                 valid["combined_score"] = 0.65 * qs + 0.35 * cs
                 choices.append(valid)
+                represented.add((valid.get("action"), valid.get("dx"), valid.get("dy")))
+
+    # Do not let Qwen accidentally hide a highly meaningful grounded option.
+    # Unmentioned legal actions remain candidates with a modest model prior.
+    for candidate in actions:
+        key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"))
+        if key in represented:
+            continue
+        extra = dict(candidate)
+        extra["qwen_score"] = 0.35
+        extra["reason"] = "grounded controller candidate"
+        cs = float(extra.get("controller_score", 0.5))
+        extra["combined_score"] = 0.65 * 0.35 + 0.35 * cs
+        choices.append(extra)
+
     return choices, intention
 
 def choose_with_variation(choices: list[dict]):
