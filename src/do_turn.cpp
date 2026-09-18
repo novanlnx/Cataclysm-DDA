@@ -185,8 +185,13 @@ static void write_response( const fs::path &dir, const std::string &command_id,
                             bool handled, bool position_changed,
                             const std::string &error = std::string() )
 {
-    const fs::path response = dir / "response.json";
-    const fs::path response_tmp = dir / "response.json.tmp";
+    // Use one response file per command.  On Windows, replacing a single
+    // response.json while an external process is polling it can race with
+    // file sharing/locking semantics.  A unique filename is both simpler and
+    // gives every command an immutable acknowledgement record.
+    const std::string safe_id = command_id.empty() ? "unknown" : command_id;
+    const fs::path response = dir / ( "response-" + safe_id + ".json" );
+    const fs::path response_tmp = dir / ( "response-" + safe_id + ".json.tmp" );
     {
         std::ofstream fout( response_tmp, std::ios::trunc );
         JsonOut jsout( fout, true );
@@ -208,8 +213,6 @@ static void write_response( const fs::path &dir, const std::string &command_id,
         jsout.end_object();
     }
     std::error_code ec;
-    fs::remove( response, ec );
-    ec.clear();
     fs::rename( response_tmp, response, ec );
     if( ec ) {
         DebugLog( D_ERROR, D_GAME ) << "Nova bridge could not publish response: " << ec.message();
