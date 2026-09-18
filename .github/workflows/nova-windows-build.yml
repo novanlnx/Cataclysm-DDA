@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - nova-cognition-ui-beta
+      - nova-survival-core-validation
 
 jobs:
   build:
@@ -47,6 +47,6 @@ jobs:
       - name: Upload patched executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: nova-cdda-cognition-ui-beta-windows-x64
+          name: nova-cdda-survival-core-validation-windows-x64
           path: cataclysm-tiles.exe
           if-no-files-found: error
