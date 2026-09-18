@@ -246,8 +246,8 @@ static bool wait_for_turn_action( avatar &u, map &m )
         int dy = 0;
         try {
             std::ifstream fin( command );
-            JsonIn jsin( fin );
-            JsonObject jo = jsin.get_object();
+            TextJsonIn jsin( fin );
+            TextJsonObject jo = jsin.get_object();
             command_id = jo.get_string( "id", "" );
             action = jo.get_string( "action", "" );
             dx = jo.get_int( "dx", 0 );
