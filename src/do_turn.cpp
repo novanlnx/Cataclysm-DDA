@@ -47,12 +47,15 @@
 #include "help.h"
 #include "input.h"
 #include "input_context.h"
+#include "item.h"
+#include "item_location.h"
 #include "item_wakeup.h"
 #include "json.h"
 #include "magic_enchantment.h"
 #include "map.h"
 #include "map_iterator.h"
 #include "map_scale_constants.h"
+#include "map_selector.h"
 #include "mapbuffer.h"
 #include "mapdata.h"
 #include "memorial_logger.h"
@@ -118,7 +121,31 @@ namespace nova_bridge
 
 namespace fs = std::filesystem;
 
-static constexpr const char *protocol_version = "nova-cdda-bridge-v1";
+static constexpr const char *protocol_version = "nova-cdda-bridge-v2-survival-alpha";
+
+struct local_tile_snapshot {
+    int dx = 0;
+    int dy = 0;
+    std::string terrain;
+    bool passable = false;
+    bool openable = false;
+    bool closable = false;
+    std::vector<std::string> items;
+};
+
+struct creature_snapshot {
+    std::string kind;
+    std::string name;
+    int dx = 0;
+    int dy = 0;
+    std::string attitude;
+};
+
+struct consumable_snapshot {
+    std::string name;
+    int nutrition = 0;
+    int quench = 0;
+};
 
 struct state_snapshot {
     int turn = 0;
@@ -131,6 +158,14 @@ struct state_snapshot {
     int sleepiness = 0;
     int stamina = 0;
     int stamina_max = 0;
+    int stored_kcal = 0;
+    int healthy_kcal = 0;
+    int pain = 0;
+    int morale = 0;
+    std::string activity;
+    std::vector<local_tile_snapshot> local_tiles;
+    std::vector<creature_snapshot> creatures;
+    std::vector<consumable_snapshot> consumables;
 };
 
 static std::optional<fs::path> bridge_dir()
@@ -147,17 +182,91 @@ static std::optional<fs::path> bridge_dir()
 
 static state_snapshot snapshot( const avatar &u )
 {
+    map &m = get_map();
     const tripoint_bub_ms pos = u.pos_bub();
-    return {
-        to_turns<int>( calendar::turn - calendar::turn_zero ),
-        pos.x(), pos.y(), pos.z(),
-        u.get_moves(),
-        u.get_hunger(),
-        u.get_thirst(),
-        u.get_sleepiness(),
-        u.get_stamina(),
-        u.get_stamina_max()
-    };
+
+    state_snapshot state;
+    state.turn = to_turns<int>( calendar::turn - calendar::turn_zero );
+    state.x = pos.x();
+    state.y = pos.y();
+    state.z = pos.z();
+    state.moves = u.get_moves();
+    state.hunger = u.get_hunger();
+    state.thirst = u.get_thirst();
+    state.sleepiness = u.get_sleepiness();
+    state.stamina = u.get_stamina();
+    state.stamina_max = u.get_stamina_max();
+    state.stored_kcal = u.get_stored_kcal();
+    state.healthy_kcal = u.get_healthy_kcal();
+    state.pain = u.get_pain();
+    state.morale = u.get_morale_level();
+    state.activity = u.activity ? u.activity.id().str() : std::string();
+
+    const bool inside = !m.is_outside( pos );
+    for( int dy = -2; dy <= 2; ++dy ) {
+        for( int dx = -2; dx <= 2; ++dx ) {
+            const tripoint_bub_ms p = pos + tripoint_rel_ms( dx, dy, 0 );
+            if( !m.inbounds( p ) ) {
+                continue;
+            }
+            local_tile_snapshot tile;
+            tile.dx = dx;
+            tile.dy = dy;
+            tile.terrain = m.name( p );
+            tile.passable = m.passable( p );
+            tile.openable = m.open_door( u, p, inside, true );
+            tile.closable = m.close_door( p, inside, true );
+            int item_count = 0;
+            for( const item &it : m.i_at( p ) ) {
+                if( item_count >= 3 ) {
+                    break;
+                }
+                tile.items.push_back( it.tname() );
+                ++item_count;
+            }
+            state.local_tiles.push_back( std::move( tile ) );
+        }
+    }
+
+    for( const monster &critter : g->all_monsters() ) {
+        const tripoint_bub_ms cp = critter.pos_bub( m );
+        const int dx = cp.x() - pos.x();
+        const int dy = cp.y() - pos.y();
+        if( std::abs( dx ) > 8 || std::abs( dy ) > 8 || cp.z() != pos.z() ) {
+            continue;
+        }
+        state.creatures.push_back( {
+            "monster", critter.name(), dx, dy,
+            Creature::attitude_raw_string( critter.attitude_to( u ) )
+        } );
+    }
+    for( const npc &guy : g->all_npcs() ) {
+        const tripoint_bub_ms cp = guy.pos_bub();
+        const int dx = cp.x() - pos.x();
+        const int dy = cp.y() - pos.y();
+        if( std::abs( dx ) > 8 || std::abs( dy ) > 8 || cp.z() != pos.z() ) {
+            continue;
+        }
+        state.creatures.push_back( {
+            "npc", guy.get_name(), dx, dy,
+            Creature::attitude_raw_string( guy.attitude_to( u ) )
+        } );
+    }
+
+    const std::vector<item_location> food_items =
+        u.cache_get_items_with( "is_food", &item::is_food );
+    for( const item_location &loc : food_items ) {
+        if( !loc || !loc->get_comestible() ) {
+            continue;
+        }
+        state.consumables.push_back( {
+            loc->tname(),
+            u.nutrition_for( *loc ),
+            loc->get_comestible()->quench
+        } );
+    }
+
+    return state;
 }
 
 static void write_state( JsonOut &jsout, const state_snapshot &state )
@@ -176,6 +285,56 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.member( "sleepiness", state.sleepiness );
     jsout.member( "stamina", state.stamina );
     jsout.member( "stamina_max", state.stamina_max );
+    jsout.member( "stored_kcal", state.stored_kcal );
+    jsout.member( "healthy_kcal", state.healthy_kcal );
+    jsout.member( "pain", state.pain );
+    jsout.member( "morale", state.morale );
+    jsout.member( "activity", state.activity );
+
+    jsout.member( "local_tiles" );
+    jsout.start_array();
+    for( const local_tile_snapshot &tile : state.local_tiles ) {
+        jsout.start_object();
+        jsout.member( "dx", tile.dx );
+        jsout.member( "dy", tile.dy );
+        jsout.member( "terrain", tile.terrain );
+        jsout.member( "passable", tile.passable );
+        jsout.member( "openable", tile.openable );
+        jsout.member( "closable", tile.closable );
+        jsout.member( "items" );
+        jsout.start_array();
+        for( const std::string &name : tile.items ) {
+            jsout.write( name );
+        }
+        jsout.end_array();
+        jsout.end_object();
+    }
+    jsout.end_array();
+
+    jsout.member( "nearby_creatures" );
+    jsout.start_array();
+    for( const creature_snapshot &creature : state.creatures ) {
+        jsout.start_object();
+        jsout.member( "kind", creature.kind );
+        jsout.member( "name", creature.name );
+        jsout.member( "dx", creature.dx );
+        jsout.member( "dy", creature.dy );
+        jsout.member( "attitude", creature.attitude );
+        jsout.end_object();
+    }
+    jsout.end_array();
+
+    jsout.member( "inventory_consumables" );
+    jsout.start_array();
+    for( const consumable_snapshot &food : state.consumables ) {
+        jsout.start_object();
+        jsout.member( "name", food.name );
+        jsout.member( "nutrition", food.nutrition );
+        jsout.member( "quench", food.quench );
+        jsout.end_object();
+    }
+    jsout.end_array();
+
     jsout.end_object();
 }
 
@@ -185,10 +344,6 @@ static void write_response( const fs::path &dir, const std::string &command_id,
                             bool handled, bool position_changed,
                             const std::string &error = std::string() )
 {
-    // Use one response file per command.  On Windows, replacing a single
-    // response.json while an external process is polling it can race with
-    // file sharing/locking semantics.  A unique filename is both simpler and
-    // gives every command an immutable acknowledgement record.
     const std::string safe_id = command_id.empty() ? "unknown" : command_id;
     const fs::path response = dir / ( "response-" + safe_id + ".json" );
     const fs::path response_tmp = dir / ( "response-" + safe_id + ".json.tmp" );
@@ -219,6 +374,38 @@ static void write_response( const fs::path &dir, const std::string &command_id,
     }
 }
 
+static bool valid_delta( int dx, int dy )
+{
+    return dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1 && !( dx == 0 && dy == 0 );
+}
+
+static item_location best_consumable( avatar &u, bool drink )
+{
+    std::vector<item_location> options = u.cache_get_items_with( "is_food", &item::is_food );
+    item_location best;
+    int best_score = -1;
+    for( item_location &loc : options ) {
+        if( !loc || !loc->get_comestible() || !u.can_consume_as_is( *loc ) ) {
+            continue;
+        }
+        const int nutrition = u.nutrition_for( *loc );
+        const int quench = loc->get_comestible()->quench;
+        if( drink ? quench <= 0 : nutrition <= 0 ) {
+            continue;
+        }
+        if( !u.will_eat( *loc, false ).success() ) {
+            continue;
+        }
+        const int score = drink ? quench * 10 + std::max( 0, nutrition )
+                          : nutrition * 10 + std::max( 0, quench );
+        if( score > best_score ) {
+            best_score = score;
+            best = loc;
+        }
+    }
+    return best;
+}
+
 static bool wait_for_turn_action( avatar &u, map &m )
 {
     const std::optional<fs::path> maybe_dir = bridge_dir();
@@ -247,6 +434,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
         std::string action;
         int dx = 0;
         int dy = 0;
+        int duration_minutes = 480;
         try {
             std::ifstream fin( command );
             TextJsonIn jsin( fin );
@@ -255,6 +443,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
             action = jo.get_string( "action", "" );
             dx = jo.get_int( "dx", 0 );
             dy = jo.get_int( "dy", 0 );
+            duration_minutes = jo.get_int( "duration_minutes", 480 );
         } catch( const std::exception &err ) {
             const state_snapshot current = snapshot( u );
             fs::remove( command, ec );
@@ -265,37 +454,102 @@ static bool wait_for_turn_action( avatar &u, map &m )
         fs::remove( command, ec );
 
         const state_snapshot before = snapshot( u );
+
         if( action == "observe" ) {
             write_response( dir, command_id, action, true, "observed",
                             before, before, false, false );
             continue;
         }
 
-        if( action != "move_one_tile" ) {
-            write_response( dir, command_id, action, false, "unsupported_action",
-                            before, before, false, false,
-                            "Spike supports only observe and move_one_tile" );
+        if( action == "quicksave" ) {
+            g->quicksave();
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, true, "saved",
+                            before, after, false, false );
             continue;
         }
 
-        if( dx < -1 || dx > 1 || dy < -1 || dy > 1 || ( dx == 0 && dy == 0 ) ) {
-            write_response( dir, command_id, action, false, "invalid_delta",
-                            before, before, false, false,
-                            "dx and dy must each be -1, 0, or 1 and may not both be 0" );
-            continue;
-        }
-
-        const bool handled = avatar_action::move( u, m, tripoint_rel_ms( dx, dy, 0 ) );
-        const state_snapshot after = snapshot( u );
-        const bool position_changed = before.x != after.x || before.y != after.y || before.z != after.z;
-        const std::string outcome = position_changed ? "moved" :
-                                    handled ? "handled_no_position_change" : "blocked";
-        write_response( dir, command_id, action, position_changed, outcome,
-                        before, after, handled, position_changed );
-
-        if( handled ) {
+        if( action == "wait_one_turn" ) {
+            u.pause();
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, true, "waited",
+                            before, after, true, false );
             return true;
         }
+
+        if( action == "sleep" ) {
+            duration_minutes = std::clamp( duration_minutes, 10, 720 );
+            u.try_to_sleep( time_duration::from_minutes( duration_minutes ) );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, true, "sleep_activity_started",
+                            before, after, true, false );
+            return true;
+        }
+
+        if( action == "eat_best_food" || action == "drink_best" ) {
+            item_location choice = best_consumable( u, action == "drink_best" );
+            if( !choice ) {
+                write_response( dir, command_id, action, false, "no_safe_consumable",
+                                before, before, false, false );
+                continue;
+            }
+            avatar_action::eat( u, choice );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, true, "consume_activity_started",
+                            before, after, true, false );
+            return true;
+        }
+
+        if( action == "open_adjacent" ) {
+            if( !valid_delta( dx, dy ) ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false );
+                continue;
+            }
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            const bool inside = !m.is_outside( u.pos_bub() );
+            if( !m.inbounds( target ) || !m.open_door( u, target, inside, true ) ) {
+                write_response( dir, command_id, action, false, "not_openable",
+                                before, before, false, false );
+                continue;
+            }
+            const bool opened = m.open_door( u, target, inside, false );
+            if( opened ) {
+                u.mod_moves( -to_moves<int>( 1_seconds ) );
+            }
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, opened,
+                            opened ? "opened" : "open_failed",
+                            before, after, opened, false );
+            if( opened ) {
+                return true;
+            }
+            continue;
+        }
+
+        if( action == "move_one_tile" ) {
+            if( !valid_delta( dx, dy ) ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false,
+                                "dx and dy must each be -1, 0, or 1 and may not both be 0" );
+                continue;
+            }
+            const bool handled = avatar_action::move( u, m, tripoint_rel_ms( dx, dy, 0 ) );
+            const state_snapshot after = snapshot( u );
+            const bool position_changed = before.x != after.x || before.y != after.y || before.z != after.z;
+            const std::string outcome = position_changed ? "moved" :
+                                        handled ? "handled_no_position_change" : "blocked";
+            write_response( dir, command_id, action, position_changed, outcome,
+                            before, after, handled, position_changed );
+            if( handled ) {
+                return true;
+            }
+            continue;
+        }
+
+        write_response( dir, command_id, action, false, "unsupported_action",
+                        before, before, false, false,
+                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, eat_best_food, drink_best, sleep, quicksave" );
     }
 }
 
