@@ -1,0 +1,240 @@
+--- a/src/do_turn.cpp
++++ b/src/do_turn.cpp
+@@ -6,17 +6,22 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
+ #include <map>
+ #include <memory>
+ #include <optional>
+ #include <ostream>
+ #include <ratio>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+ #include "action.h"
++#include "avatar_action.h"
+ #include "activity_type.h"
+ #include "avatar.h"
+ #include "bionics.h"
+@@ -43,6 +48,7 @@
+ #include "input.h"
+ #include "input_context.h"
+ #include "item_wakeup.h"
++#include "json.h"
+ #include "magic_enchantment.h"
+ #include "map.h"
+ #include "map_iterator.h"
+@@ -107,6 +113,197 @@
+ 
+ #define dbg(x) DebugLog((x),D_GAME) << __FILE__ << ":" << __LINE__ << ": "
+ 
++namespace nova_bridge
++{
++
++namespace fs = std::filesystem;
++
++static constexpr const char *protocol_version = "nova-cdda-bridge-v1";
++
++struct state_snapshot {
++    int turn = 0;
++    int x = 0;
++    int y = 0;
++    int z = 0;
++    int moves = 0;
++    int hunger = 0;
++    int thirst = 0;
++    int sleepiness = 0;
++    int stamina = 0;
++    int stamina_max = 0;
++};
++
++static std::optional<fs::path> bridge_dir()
++{
++    static const std::optional<fs::path> dir = []() -> std::optional<fs::path> {
++        const char *raw = std::getenv( "NOVA_BRIDGE_DIR" );
++        if( raw == nullptr || *raw == '\0' ) {
++            return std::nullopt;
++        }
++        return fs::path( raw );
++    }();
++    return dir;
++}
++
++static state_snapshot snapshot( const avatar &u )
++{
++    const tripoint_bub_ms pos = u.pos_bub();
++    return {
++        to_turns<int>( calendar::turn - calendar::turn_zero ),
++        pos.x(),
++        pos.y(),
++        pos.z(),
++        u.get_moves(),
++        u.get_hunger(),
++        u.get_thirst(),
++        u.get_sleepiness(),
++        u.get_stamina(),
++        u.get_stamina_max()
++    };
++}
++
++static void write_state( JsonOut &jsout, const state_snapshot &state )
++{
++    jsout.start_object();
++    jsout.member( "turn", state.turn );
++    jsout.member( "position" );
++    jsout.start_object();
++    jsout.member( "x", state.x );
++    jsout.member( "y", state.y );
++    jsout.member( "z", state.z );
++    jsout.end_object();
++    jsout.member( "moves", state.moves );
++    jsout.member( "hunger", state.hunger );
++    jsout.member( "thirst", state.thirst );
++    jsout.member( "sleepiness", state.sleepiness );
++    jsout.member( "stamina", state.stamina );
++    jsout.member( "stamina_max", state.stamina_max );
++    jsout.end_object();
++}
++
++static void write_response( const fs::path &dir, const std::string &command_id,
++                            const std::string &action, bool success, const std::string &outcome,
++                            const state_snapshot &before, const state_snapshot &after,
++                            bool handled, bool position_changed,
++                            const std::string &error = std::string() )
++{
++    const fs::path response = dir / "response.json";
++    const fs::path response_tmp = dir / "response.json.tmp";
++    {
++        std::ofstream fout( response_tmp, std::ios::trunc );
++        JsonOut jsout( fout, true );
++        jsout.start_object();
++        jsout.member( "protocol", protocol_version );
++        jsout.member( "id", command_id );
++        jsout.member( "action", action );
++        jsout.member( "success", success );
++        jsout.member( "outcome", outcome );
++        jsout.member( "handled", handled );
++        jsout.member( "position_changed", position_changed );
++        if( !error.empty() ) {
++            jsout.member( "error", error );
++        }
++        jsout.member( "before" );
++        write_state( jsout, before );
++        jsout.member( "after" );
++        write_state( jsout, after );
++        jsout.end_object();
++    }
++    std::error_code ec;
++    fs::remove( response, ec );
++    ec.clear();
++    fs::rename( response_tmp, response, ec );
++    if( ec ) {
++        DebugLog( D_ERROR, D_GAME ) << "Nova bridge could not publish response: " << ec.message();
++    }
++}
++
++static bool wait_for_turn_action( avatar &u, map &m )
++{
++    const std::optional<fs::path> maybe_dir = bridge_dir();
++    if( !maybe_dir ) {
++        return false;
++    }
++    const fs::path dir = *maybe_dir;
++    std::error_code ec;
++    fs::create_directories( dir, ec );
++    if( ec ) {
++        DebugLog( D_ERROR, D_GAME ) << "Nova bridge could not create IPC directory: " << ec.message();
++        return false;
++    }
++
++    const fs::path command = dir / "command.json";
++    while( true ) {
++        if( !fs::exists( command, ec ) ) {
++            ec.clear();
++            inp_mngr.pump_events();
++            std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
++            continue;
++        }
++
++        std::string command_id;
++        std::string action;
++        int dx = 0;
++        int dy = 0;
++        try {
++            std::ifstream fin( command );
++            TextJsonIn jsin( fin, command.string() );
++            TextJsonObject jo = jsin.get_object();
++            command_id = jo.get_string( "id", "" );
++            action = jo.get_string( "action", "" );
++            dx = jo.get_int( "dx", 0 );
++            dy = jo.get_int( "dy", 0 );
++        } catch( const std::exception &err ) {
++            const state_snapshot current = snapshot( u );
++            fs::remove( command, ec );
++            write_response( dir, command_id, action, false, "invalid_command",
++                            current, current, false, false, err.what() );
++            continue;
++        }
++        fs::remove( command, ec );
++
++        const state_snapshot before = snapshot( u );
++        if( action == "observe" ) {
++            write_response( dir, command_id, action, true, "observed",
++                            before, before, false, false );
++            continue;
++        }
++
++        if( action != "move_one_tile" ) {
++            write_response( dir, command_id, action, false, "unsupported_action",
++                            before, before, false, false,
++                            "Spike supports only observe and move_one_tile" );
++            continue;
++        }
++
++        if( dx < -1 || dx > 1 || dy < -1 || dy > 1 || ( dx == 0 && dy == 0 ) ) {
++            write_response( dir, command_id, action, false, "invalid_delta",
++                            before, before, false, false,
++                            "dx and dy must each be -1, 0, or 1 and may not both be 0" );
++            continue;
++        }
++
++        const bool handled = avatar_action::move( u, m, tripoint_rel_ms( dx, dy, 0 ) );
++        const state_snapshot after = snapshot( u );
++        const bool position_changed = before.x != after.x || before.y != after.y || before.z != after.z;
++        const std::string outcome = position_changed ? "moved" :
++                                    handled ? "handled_no_position_change" : "blocked";
++        write_response( dir, command_id, action, position_changed, outcome,
++                        before, after, handled, position_changed );
++
++        if( handled ) {
++            return true;
++        }
++    }
++}
++
++} // namespace nova_bridge
++
+ namespace turn_handler
+ {
+ bool cleanup_at_end()
+@@ -661,7 +858,12 @@
+                     queue_screenshot = false;
+                 }
+ 
+-                if( handle_action() ) {
++                if( nova_bridge::bridge_dir() ) {
++                    if( nova_bridge::wait_for_turn_action( u, m ) ) {
++                        ++moves_since_last_save;
++                        u.action_taken();
++                    }
++                } else if( handle_action() ) {
+                     ++moves_since_last_save;
+                     u.action_taken();
+                 }
