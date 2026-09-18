@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iosfwd>
 #include <iterator>
 #include <memory>
@@ -350,6 +353,40 @@ static void draw_messages( const draw_args &args )
     wnoutrefresh( w );
 }
 
+static void draw_nova_thoughts( const draw_args &args )
+{
+    const catacurses::window &w = args._win;
+    werase( w );
+    decorate_panel( "Nova", w );
+
+    std::vector<std::string> lines;
+    const char *raw_dir = std::getenv( "NOVA_BRIDGE_DIR" );
+    if( raw_dir != nullptr && *raw_dir != '\0' ) {
+        const std::filesystem::path thought_file =
+            std::filesystem::path( raw_dir ) / "nova-thoughts.txt";
+        std::ifstream fin( thought_file );
+        std::string line;
+        while( std::getline( fin, line ) ) {
+            if( !line.empty() ) {
+                lines.push_back( line );
+            }
+        }
+    }
+
+    if( lines.empty() ) {
+        lines.push_back( "Waiting for Nova..." );
+    }
+
+    const int usable_width = std::max( 1, getmaxx( w ) - 2 );
+    const size_t start = lines.size() > 3 ? lines.size() - 3 : 0;
+    int row = 1;
+    for( size_t i = start; i < lines.size() && row <= 3; ++i, ++row ) {
+        mvwprintz( w, point( 1, row ), c_light_cyan,
+                   trunc_ellipse( lines[i], static_cast<unsigned int>( usable_width ) ) );
+    }
+    wnoutrefresh( w );
+}
+
 #if defined(TILES)
 static void draw_mminimap( const draw_args &args )
 {
@@ -383,6 +420,10 @@ static std::vector<window_panel> initialize_default_custom_panels( const widget 
         widget row_widget = row_wid.obj();
         ret.emplace_back( row_widget.get_window_panel( width ) );
     }
+
+    // Add Nova's live three-line cognition feed before the ordinary message log.
+    ret.emplace_back( draw_nova_thoughts, "Nova", to_translation( "Nova" ),
+                      5, width, true );
 
     // Add compass, message log, and map to fill remaining space
     // TODO: Make these into proper widgets
