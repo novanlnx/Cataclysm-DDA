@@ -234,6 +234,7 @@ def situation_summary(state: dict, wm: WorldModel) -> dict:
                 "dx": t.get("dx"), "dy": t.get("dy"),
                 "terrain": t.get("terrain", ""),
                 "items": t.get("items")[:3],
+                "ground_consumables": (t.get("ground_consumables") or [])[:3],
             })
 
     return {
@@ -320,27 +321,45 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "progress": "new position" if visits == 0 else "known position",
             })
 
+    # Validation sub-batch: pickup + eat + drink only.  Pickup is exposed
+    # only for real nearby comestibles that the bridge identified.
+    for (dx, dy), t in tiles.items():
+        if abs(dx) > 1 or abs(dy) > 1:
+            continue
+        for food in (t.get("ground_consumables") or [])[:3]:
+            name = str(food.get("name", "")).strip()
+            if not name:
+                continue
+            nutrition = int(food.get("nutrition", 0) or 0)
+            quench = int(food.get("quench", 0) or 0)
+            score = 0.55
+            if nutrition > 0:
+                score += 0.18
+            if quench > 0:
+                score += 0.18
+            actions.append({
+                "action": "pickup_consumable", "dx": dx, "dy": dy, "item_name": name,
+                "label": f"pick up {name}",
+                "controller_score": min(0.95, score),
+                "progress": "acquires food/drink resource",
+                "nutrition": nutrition,
+                "quench": quench,
+            })
+
     consumables = state.get("inventory_consumables", [])
+    hunger = int(state.get("hunger", 0) or 0)
+    thirst = int(state.get("thirst", 0) or 0)
     if any(int(x.get("nutrition", 0) or 0) > 0 for x in consumables):
         actions.append({
             "action": "eat_best_food",
             "label": "eat the best safe carried food",
-            "controller_score": 0.35,
+            "controller_score": min(0.90, 0.30 + max(0, hunger) / 180.0),
         })
     if any(int(x.get("quench", 0) or 0) > 0 for x in consumables):
         actions.append({
             "action": "drink_best",
             "label": "drink the best safe carried drink",
-            "controller_score": 0.35,
-        })
-
-    sleepy = int(state.get("sleepiness", 0) or 0)
-    # Do not even show sleep to Qwen unless the character is actually tired.
-    if sleepy >= 191:
-        actions.append({
-            "action": "sleep", "duration_minutes": 480,
-            "label": "try to sleep",
-            "controller_score": min(1.0, 0.45 + max(0, sleepy - 191) / 600.0),
+            "controller_score": min(0.90, 0.30 + max(0, thirst) / 160.0),
         })
 
     stamina = int(state.get("stamina", 0) or 0)
@@ -405,13 +424,16 @@ def normalize_choice(raw: dict, allowed: list[dict]):
     for candidate in allowed:
         if candidate.get("action") != action:
             continue
-        if action in {"move_one_tile", "open_adjacent"}:
+        if action in {"move_one_tile", "open_adjacent", "pickup_consumable"}:
             try:
                 dx = int(raw.get("dx"))
                 dy = int(raw.get("dy"))
             except Exception:
                 continue
             if dx != candidate.get("dx") or dy != candidate.get("dy"):
+                continue
+        if action == "pickup_consumable":
+            if str(raw.get("item_name", "")) != str(candidate.get("item_name", "")):
                 continue
         out = dict(candidate)
         out["reason"] = str(raw.get("reason", ""))[:300]
@@ -437,9 +459,8 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         "A safe action is not automatically useful: prefer actions that make progress. "
         "Repeated backtracking and pacing are bad unless there is a concrete reason. "
         "A closed door while indoors may be an exit or access to unexplored space. "
-        "Visible useful objects matter, but an active intention must be achievable with allowed_actions now. "
-        "If food or supplies are visible but there is no pickup/use action available, remember them as future resources "
-        "instead of choosing 'gather supplies' as the current intention. "
+        "Visible food and drink can be acquired only when pickup_consumable is listed in allowed_actions. "
+        "An active intention must be achievable with allowed_actions now. "
         "Never invent an action that is not in allowed_actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
     )
@@ -455,7 +476,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         )
     instruction += (
         'Schema: {"intention":"short goal","choices":['
-        '{"action":"exact action","dx":0,"dy":0,"duration_minutes":480,'
+        '{"action":"exact action","dx":0,"dy":0,"item_name":"exact visible item name","duration_minutes":480,'
         '"score":0.0,"reason":"one short evidence-grounded reason"}]}. '
         "Return up to 3 choices."
     )
@@ -484,12 +505,12 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
                 cs = float(valid.get("controller_score", 0.5))
                 valid["combined_score"] = 0.65 * qs + 0.35 * cs
                 choices.append(valid)
-                represented.add((valid.get("action"), valid.get("dx"), valid.get("dy")))
+                represented.add((valid.get("action"), valid.get("dx"), valid.get("dy"), valid.get("item_name")))
 
     # Do not let Qwen accidentally hide a highly meaningful grounded option.
     # Unmentioned legal actions remain candidates with a modest model prior.
     for candidate in actions:
-        key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"))
+        key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"), candidate.get("item_name"))
         if key in represented:
             continue
         extra = dict(candidate)
@@ -535,7 +556,7 @@ def append_log(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 def command_kwargs(choice: dict) -> dict:
-    return {k: choice[k] for k in ("dx", "dy", "duration_minutes") if k in choice}
+    return {k: choice[k] for k in ("dx", "dy", "item_name", "duration_minutes") if k in choice}
 
 def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -658,6 +679,7 @@ def main() -> int:
         print(f"[{action_count}] {action}: {outcome} | goal={wm.active_intention!r} | {reason[:90]}")
         wm.record_action(choice, outcome)
 
+        previous_state = state
         try:
             obs = send_command("observe", timeout=900.0)
             state = state_from_response(obs)
@@ -668,13 +690,48 @@ def main() -> int:
             print(f"Observe failed: {exc}")
             break
 
-        if action_count % 25 == 0:
-            try:
-                save_result = send_command("quicksave", timeout=120.0)
-                append_log(log_path, {"wall_time": utc_now(), "checkpoint": save_result})
-                feed.push("CHECKPOINT: game saved.")
-            except Exception as exc:
-                append_log(log_path, {"wall_time": utc_now(), "quicksave_error": repr(exc)})
+        verification = None
+        if action == "pickup_consumable":
+            verification = {
+                "verified": int(state.get("inventory_count", 0) or 0) >
+                            int(previous_state.get("inventory_count", 0) or 0),
+                "evidence": "inventory_count_increase",
+                "before": previous_state.get("inventory_count"),
+                "after": state.get("inventory_count"),
+            }
+        elif action == "eat_best_food":
+            verification = {
+                "verified": (
+                    int(state.get("hunger", 0) or 0) < int(previous_state.get("hunger", 0) or 0)
+                    or int(state.get("stored_kcal", 0) or 0) > int(previous_state.get("stored_kcal", 0) or 0)
+                ),
+                "evidence": "hunger_down_or_stored_kcal_up",
+                "before_hunger": previous_state.get("hunger"),
+                "after_hunger": state.get("hunger"),
+                "before_kcal": previous_state.get("stored_kcal"),
+                "after_kcal": state.get("stored_kcal"),
+            }
+        elif action == "drink_best":
+            verification = {
+                "verified": int(state.get("thirst", 0) or 0) <
+                            int(previous_state.get("thirst", 0) or 0),
+                "evidence": "thirst_decrease",
+                "before": previous_state.get("thirst"),
+                "after": state.get("thirst"),
+            }
+
+        if verification is not None:
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "verification_for_action": action_count,
+                "action": action,
+                "completion_evidence": verification,
+            })
+            feed.push(
+                ("VERIFIED: " if verification["verified"] else "UNVERIFIED: ")
+                + action + " — " + verification["evidence"]
+            )
+
 
     feed.push(f"SESSION: finished after {action_count} actions.")
     print()
