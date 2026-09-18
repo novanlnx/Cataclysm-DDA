@@ -528,10 +528,11 @@ def main() -> int:
     print(f"Log: {log_path}")
     print()
 
-    feed.push("NOVA: waiting for the world state.")
+    feed.push("NOVA: waiting for a character to enter the world.")
+    print("Waiting for a loaded character. You can take your time in the menus...")
 
     try:
-        obs = send_command("observe", timeout=30.0)
+        obs = send_command("observe", timeout=1800.0)
     except Exception as exc:
         print(f"Cannot reach CDDA bridge: {exc}")
         feed.push("ERROR: cannot reach CDDA bridge.")
