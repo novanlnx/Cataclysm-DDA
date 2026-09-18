@@ -124,6 +124,13 @@ namespace fs = std::filesystem;
 
 static constexpr const char *protocol_version = "nova-cdda-bridge-v3-cognition-beta";
 
+struct ground_item_snapshot {
+    std::string name;
+    int nutrition = 0;
+    int quench = 0;
+    double melee_value = 0.0;
+};
+
 struct local_tile_snapshot {
     int dx = 0;
     int dy = 0;
@@ -132,6 +139,7 @@ struct local_tile_snapshot {
     bool openable = false;
     bool closable = false;
     std::vector<std::string> items;
+    std::vector<ground_item_snapshot> item_details;
 };
 
 struct creature_snapshot {
@@ -235,6 +243,15 @@ static state_snapshot snapshot( avatar &u )
                     break;
                 }
                 tile.items.push_back( it.tname() );
+                int nutrition = 0;
+                int quench = 0;
+                if( it.get_comestible() ) {
+                    nutrition = u.nutrition_for( it );
+                    quench = it.get_comestible()->quench;
+                }
+                tile.item_details.push_back( {
+                    it.tname(), nutrition, quench, u.melee_value( it )
+                } );
                 ++item_count;
             }
             state.local_tiles.push_back( std::move( tile ) );
@@ -333,6 +350,17 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
         jsout.start_array();
         for( const std::string &name : tile.items ) {
             jsout.write( name );
+        }
+        jsout.end_array();
+        jsout.member( "item_details" );
+        jsout.start_array();
+        for( const ground_item_snapshot &it : tile.item_details ) {
+            jsout.start_object();
+            jsout.member( "name", it.name );
+            jsout.member( "nutrition", it.nutrition );
+            jsout.member( "quench", it.quench );
+            jsout.member( "melee_value", it.melee_value );
+            jsout.end_object();
         }
         jsout.end_array();
         jsout.end_object();
