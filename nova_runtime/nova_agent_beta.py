@@ -299,6 +299,40 @@ def describe_situation(s: dict) -> str:
         parts.append("repeating path")
     return "; ".join(parts)
 
+def visible_storable_consumables(state: dict) -> list[dict]:
+    found = []
+    for tile in state.get("local_tiles", []):
+        try:
+            dx = int(tile.get("dx", 0))
+            dy = int(tile.get("dy", 0))
+        except Exception:
+            continue
+        for food in (tile.get("ground_consumables") or []):
+            if not bool(food.get("storable_without_wield", False)):
+                continue
+            name = str(food.get("name", "")).strip()
+            if not name:
+                continue
+            found.append({
+                "dx": dx,
+                "dy": dy,
+                "name": name,
+                "nutrition": int(food.get("nutrition", 0) or 0),
+                "quench": int(food.get("quench", 0) or 0),
+                "distance": abs(dx) + abs(dy),
+            })
+    return found
+
+def resource_need_weight(state: dict, resource: dict) -> float:
+    hunger = max(0, int(state.get("hunger", 0) or 0))
+    thirst = max(0, int(state.get("thirst", 0) or 0))
+    weight = 0.10  # modest value for stocking a nearby survival resource
+    if int(resource.get("quench", 0) or 0) > 0:
+        weight += min(0.30, thirst / 240.0)
+    if int(resource.get("nutrition", 0) or 0) > 0:
+        weight += min(0.25, hunger / 300.0)
+    return weight
+
 def goal_candidates(state: dict, actions: list[dict]) -> list[dict]:
     candidates = []
     action_names = {a.get("action") for a in actions}
@@ -317,6 +351,22 @@ def goal_candidates(state: dict, actions: list[dict]) -> list[dict]:
             "supported_by": ["eat_best_food"],
             "priority": 0.96,
         })
+    visible_resources = visible_storable_consumables(state)
+    nonadjacent_resources = [r for r in visible_resources if int(r.get("distance", 99)) > 1]
+    if nonadjacent_resources and "move_one_tile" in action_names:
+        target = max(
+            nonadjacent_resources,
+            key=lambda r: resource_need_weight(state, r) - 0.03 * float(r.get("distance", 0))
+        )
+        need_bonus = resource_need_weight(state, target)
+        candidates.append({
+            "goal_id": "approach_consumable",
+            "intention": f"move toward nearby {target['name']} so it can be collected",
+            "supported_by": ["move_one_tile", "pickup_consumable"],
+            "priority": min(0.93, 0.80 + need_bonus),
+            "target": target,
+        })
+
     if "pickup_consumable" in action_names:
         candidates.append({
             "goal_id": "acquire_consumable",
@@ -372,6 +422,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     tiles = tile_map(state)
     hostiles = hostile_positions(state)
     loop = wm.looping()
+    visible_resources = visible_storable_consumables(state)
 
     for name, (dx, dy) in CARDINALS.items():
         t = tiles.get((dx, dy))
@@ -409,12 +460,35 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 
             novelty = 1.0 / (1.0 + visits)
             score = 0.58 + 0.30 * novelty
+            resource_distance_delta = 0
+            nearest_resource = None
+            if visible_resources:
+                nearest_resource = min(
+                    visible_resources,
+                    key=lambda r: abs(int(r["dx"])) + abs(int(r["dy"]))
+                )
+                before_distance = abs(int(nearest_resource["dx"])) + abs(int(nearest_resource["dy"]))
+                after_distance = (
+                    abs(int(nearest_resource["dx"]) - dx)
+                    + abs(int(nearest_resource["dy"]) - dy)
+                )
+                resource_distance_delta = before_distance - after_distance
+                need_weight = resource_need_weight(state, nearest_resource)
+                if resource_distance_delta > 0:
+                    score += 0.22 + need_weight
+                elif resource_distance_delta < 0:
+                    score -= 0.22 + 0.5 * need_weight
             if backtrack:
                 score -= 0.32
             if (dx, dy) in hostiles:
                 score -= 0.65
             if loop and visits > 0:
                 score -= 0.18
+            progress = "new position" if visits == 0 else "known position"
+            if resource_distance_delta > 0 and nearest_resource:
+                progress = f"moves closer to {nearest_resource['name']}"
+            elif resource_distance_delta < 0 and nearest_resource:
+                progress = f"moves farther from {nearest_resource['name']}"
             actions.append({
                 "action": "move_one_tile", "dx": dx, "dy": dy,
                 "label": f"move {name}",
@@ -422,8 +496,10 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "visits_target": visits,
                 "immediate_backtrack": backtrack,
                 "hostile_on_tile": (dx, dy) in hostiles,
+                "resource_distance_delta": resource_distance_delta,
+                "resource_target": nearest_resource,
                 "controller_score": max(0.0, min(1.0, score)),
-                "progress": "new position" if visits == 0 else "known position",
+                "progress": progress,
             })
 
     # Validation sub-batch: pickup + eat + drink only.  Pickup is exposed
@@ -567,6 +643,9 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         "Repeated backtracking and pacing are bad unless there is a concrete reason. "
         "A closed door while indoors may be an exit or access to unexplored space. "
         "Visible food and drink can be acquired only when pickup_consumable is listed in allowed_actions. "
+        "When a visible storable consumable is not adjacent, movement choices include resource_distance_delta: "
+        "positive means the move gets closer, negative means farther away. Prefer getting closer when the active goal "
+        "is approach_consumable. "
         "An active intention must be achievable with allowed_actions now. "
         "Never invent an action that is not in allowed_actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
@@ -616,7 +695,23 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
                 # Hybrid executive score: Qwen judgment + grounded progress utility.
                 qs = float(valid.get("qwen_score", 0.5))
                 cs = float(valid.get("controller_score", 0.5))
-                valid["combined_score"] = 0.65 * qs + 0.35 * cs
+                goal_bonus = 0.0
+                if goal_id == "approach_consumable":
+                    delta = int(valid.get("resource_distance_delta", 0) or 0)
+                    if valid.get("action") == "pickup_consumable":
+                        goal_bonus += 0.30
+                    elif valid.get("action") == "move_one_tile" and delta > 0:
+                        goal_bonus += 0.24
+                    elif valid.get("action") == "move_one_tile" and delta < 0:
+                        goal_bonus -= 0.35
+                elif goal_id == "acquire_consumable" and valid.get("action") == "pickup_consumable":
+                    goal_bonus += 0.30
+                elif goal_id == "reduce_hunger" and valid.get("action") == "eat_best_food":
+                    goal_bonus += 0.30
+                elif goal_id == "reduce_thirst" and valid.get("action") == "drink_best":
+                    goal_bonus += 0.30
+                valid["goal_bonus"] = goal_bonus
+                valid["combined_score"] = max(0.0, min(1.0, 0.65 * qs + 0.35 * cs + goal_bonus))
                 choices.append(valid)
                 represented.add((valid.get("action"), valid.get("dx"), valid.get("dy"), valid.get("item_name")))
 
@@ -630,7 +725,23 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         extra["qwen_score"] = 0.35
         extra["reason"] = "grounded controller candidate"
         cs = float(extra.get("controller_score", 0.5))
-        extra["combined_score"] = 0.65 * 0.35 + 0.35 * cs
+        goal_bonus = 0.0
+        if goal_id == "approach_consumable":
+            delta = int(extra.get("resource_distance_delta", 0) or 0)
+            if extra.get("action") == "pickup_consumable":
+                goal_bonus += 0.30
+            elif extra.get("action") == "move_one_tile" and delta > 0:
+                goal_bonus += 0.24
+            elif extra.get("action") == "move_one_tile" and delta < 0:
+                goal_bonus -= 0.35
+        elif goal_id == "acquire_consumable" and extra.get("action") == "pickup_consumable":
+            goal_bonus += 0.30
+        elif goal_id == "reduce_hunger" and extra.get("action") == "eat_best_food":
+            goal_bonus += 0.30
+        elif goal_id == "reduce_thirst" and extra.get("action") == "drink_best":
+            goal_bonus += 0.30
+        extra["goal_bonus"] = goal_bonus
+        extra["combined_score"] = max(0.0, min(1.0, 0.65 * 0.35 + 0.35 * cs + goal_bonus))
         choices.append(extra)
 
     return choices, goal_id, intention
