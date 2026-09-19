@@ -2306,9 +2306,9 @@ def main() -> int:
                 wm.active_intention = ""
     
         except KeyboardInterrupt:
-        abort_reason = "user_interrupt"
-        print()
-        print("Nova runtime interrupted by user; recording this attempt as aborted.")
+            abort_reason = "user_interrupt"
+            print()
+            print("Nova runtime interrupted by user; recording this attempt as aborted.")
 
     # A validation window ending is not a death. Record it as aborted/debug.
     # The next attempt keeps the same life_number but receives a fresh UUID.
