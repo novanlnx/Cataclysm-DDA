@@ -1256,6 +1256,12 @@ def consumable_counts(state: dict, predicate) -> dict[tuple[str, int, int], int]
         counts[key] = counts.get(key, 0) + 1
     return counts
 
+def serializable_consumable_counts(counts: dict[tuple[str, int, int], int]) -> list[dict]:
+    return [
+        {"name": key[0], "nutrition": key[1], "quench": key[2], "count": count}
+        for key, count in sorted(counts.items())
+    ]
+
 def inventory_consumable_changed(before: dict, after: dict, mode: str) -> tuple[bool, dict]:
     if mode == "eat":
         predicate = lambda x: int(x.get("nutrition", 0) or 0) > 0
@@ -1263,8 +1269,16 @@ def inventory_consumable_changed(before: dict, after: dict, mode: str) -> tuple[
         predicate = lambda x: int(x.get("quench", 0) or 0) > 0
     b = consumable_counts(before, predicate)
     a = consumable_counts(after, predicate)
-    changed = any(a.get(key, 0) < count for key, count in b.items())
-    return changed, {"before": b, "after": a}
+    changed_keys = [key for key, count in b.items() if a.get(key, 0) < count]
+    changed = bool(changed_keys)
+    return changed, {
+        "before": serializable_consumable_counts(b),
+        "after": serializable_consumable_counts(a),
+        "decreased_or_removed": [
+            {"name": key[0], "nutrition": key[1], "quench": key[2]}
+            for key in sorted(changed_keys)
+        ],
+    }
 
 def verify_step(plan: Plan, action: dict, outcome: str, before: dict,
                 after: dict, result: dict | None) -> tuple[bool, bool, dict]:
@@ -1589,9 +1603,14 @@ def main() -> int:
 
         # Option A activity contract: with the native C++ gate, this observe
         # should not be serviced until the current activity has completed.
+        post_activity_observe_retries = 0
         try:
             obs = send_command("observe", timeout=900.0)
             state = state_from_response(obs)
+            if action in {"eat_best_food", "drink_best"} and str(state.get("activity", "") or ""):
+                post_activity_observe_retries = 1
+                obs = send_command("observe", timeout=900.0)
+                state = state_from_response(obs)
             wm.observe(state)
         except Exception as exc:
             append_log(log_path, {"wall_time": utc_now(), "observe_error": repr(exc)})
@@ -1607,6 +1626,7 @@ def main() -> int:
             if action in {"eat_best_food", "drink_best"}
             else None
         )
+        verification["post_activity_observe_retries"] = post_activity_observe_retries
 
         step = plan.current_step
         if progress:
