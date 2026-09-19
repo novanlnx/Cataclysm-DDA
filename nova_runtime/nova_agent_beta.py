@@ -95,6 +95,33 @@ class LifeEnded(RuntimeError):
         super().__init__("Nova life ended")
         self.status = status
 
+class BridgeTransportError(RuntimeError):
+    pass
+
+def write_command_atomic(path: Path, payload: dict) -> None:
+    """Publish command.json as verified UTF-8 bytes with no BOM."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if not raw.startswith(b"{"):
+        raise BridgeTransportError("Refusing to publish malformed command payload")
+    last_error = None
+    for _ in range(40):
+        try:
+            with tmp.open("wb") as f:
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            if tmp.read_bytes() != raw:
+                raise BridgeTransportError("Command temp-file verification failed")
+            tmp.replace(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.025)
+    if last_error:
+        raise BridgeTransportError(f"Could not publish command.json: {last_error}")
+
 def read_json_safe(path: Path) -> dict | None:
     try:
         if not path.exists():
@@ -205,33 +232,74 @@ def previous_life_context(limit: int = 5) -> list[dict]:
 def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
     BRIDGE.mkdir(parents=True, exist_ok=True)
     command_path = BRIDGE / "command.json"
-    command_id = uuid.uuid4().hex
-    response_path = BRIDGE / f"response-{command_id}.json"
-    payload = {"id": command_id, "action": action, **kwargs}
-    if command_path.exists():
-        command_path.unlink()
-    if response_path.exists():
-        response_path.unlink()
-    write_json_atomic(command_path, payload)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if response_path.exists():
+    unknown_response_path = BRIDGE / "response-unknown.json"
+    payload_base = {"action": action, **kwargs}
+    last_invalid_error = None
+
+    # A malformed command is known not to have executed because the bridge
+    # rejects it before dispatch. One retry is therefore safe and prevents a
+    # transient command-file corruption from turning into a 60-second timeout.
+    for attempt in range(2):
+        command_id = uuid.uuid4().hex
+        response_path = BRIDGE / f"response-{command_id}.json"
+        payload = {"id": command_id, **payload_base}
+
+        for stale in (command_path, response_path, unknown_response_path):
             try:
-                data = json.loads(response_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                time.sleep(0.05)
-                continue
-            if data.get("id") == command_id:
+                stale.unlink()
+            except OSError:
+                pass
+
+        write_command_atomic(command_path, payload)
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            if response_path.exists():
                 try:
-                    response_path.unlink()
-                except OSError:
-                    pass
-                return data
-        life_status = read_life_status()
-        if life_status and str(life_status.get("status", "")) == "dead":
-            raise LifeEnded(life_status)
-        time.sleep(0.05)
-    raise TimeoutError(f"Timed out waiting for CDDA response to {action} ({command_id})")
+                    data = json.loads(response_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    time.sleep(0.05)
+                    continue
+                if data.get("id") == command_id:
+                    try:
+                        response_path.unlink()
+                    except OSError:
+                        pass
+                    return data
+
+            if unknown_response_path.exists():
+                unknown = read_json_safe(unknown_response_path)
+                if unknown and unknown.get("outcome") == "invalid_command":
+                    last_invalid_error = str(unknown.get("error") or "invalid_command")
+                    try:
+                        unknown_response_path.unlink()
+                    except OSError:
+                        pass
+                    break
+
+            life_status = read_life_status()
+            if life_status and str(life_status.get("status", "")) == "dead":
+                raise LifeEnded(life_status)
+            time.sleep(0.05)
+        else:
+            life_status = read_life_status()
+            if life_status and str(life_status.get("status", "")) == "dead":
+                raise LifeEnded(life_status)
+            alive_note = (
+                " while bridge life-status still reported alive"
+                if life_status and str(life_status.get("status", "")) == "alive"
+                else ""
+            )
+            raise BridgeTransportError(
+                f"Timed out waiting for CDDA response to {action} ({command_id}){alive_note}"
+            )
+
+        if attempt == 0:
+            continue
+
+    raise BridgeTransportError(
+        f"Bridge rejected {action} command as invalid after retry: {last_invalid_error}"
+    )
 
 def ollama_json(path: str, payload: dict | None = None, timeout: float = 180.0) -> dict:
     url = OLLAMA + path
@@ -2028,6 +2096,7 @@ def main() -> int:
     plan: Plan | None = None
 
     abort_reason = "validation_window_ended"
+    transport_failure: dict | None = None
     try:
         while time.monotonic() < deadline:
             sit = situation_summary(state, wm)
@@ -2193,6 +2262,11 @@ def main() -> int:
                     "bridge_latency_seconds": bridge_latency,
                 })
                 print(f"[{action_count}] {action}: COMMAND ERROR {command_error}")
+                transport_failure = {
+                    "stage": "command",
+                    "action": action,
+                    "error": command_error,
+                }
                 break
     
             wm.record_action(state_before, choice, outcome, result)
@@ -2227,6 +2301,11 @@ def main() -> int:
                 append_log(log_path, {"wall_time": utc_now(), "observe_error": repr(exc)})
                 feed.push("ERROR: lost world observation.")
                 print(f"Observe failed: {exc}")
+                transport_failure = {
+                    "stage": "observe",
+                    "action": action,
+                    "error": repr(exc),
+                }
                 break
     
             progress, step_complete, verification = verify_step(
@@ -2309,6 +2388,27 @@ def main() -> int:
         abort_reason = "user_interrupt"
         print()
         print("Nova runtime interrupted by user; recording this attempt as aborted.")
+
+    if transport_failure is not None:
+        # Transport/runtime failure is not a life event. Preserve the active
+        # marker and current life identity so the next startup can ask CDDA
+        # whether this same body is still alive.
+        life.observe(state, action_count, force_sample=True)
+        write_active_life_marker(life)
+        append_log(log_path, {
+            "wall_time": utc_now(),
+            "session_event": "transport_failure",
+            "life_id": life.life_id,
+            "life_number": life.life_number,
+            "transport_failure": transport_failure,
+            "terminal_record_written": False,
+        })
+        feed.push("ERROR: bridge transport failed; life identity preserved.")
+        print()
+        print("TRANSPORT FAILURE — life was NOT ended.")
+        print(f"Life {life.life_number} / {life.life_id[:8]} remains active for recovery.")
+        print(f"Log saved to: {log_path}")
+        return 4
 
     # A validation window ending is not a death. Record it as aborted/debug.
     # The next attempt keeps the same life_number but receives a fresh UUID.
