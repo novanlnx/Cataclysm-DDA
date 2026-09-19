@@ -1209,7 +1209,12 @@ bool game::do_turn()
                 }
 
                 if( nova_bridge::bridge_dir() ) {
-                    if( nova_bridge::wait_for_turn_action( u, m ) ) {
+                    // Once a native CDDA activity has started (eating, sleeping,
+                    // crafting, etc.), let CDDA own it until completion or native
+                    // interruption.  Do not ask Nova for another action while the
+                    // current activity is still in progress; that can duplicate
+                    // commands before their effects have resolved.
+                    if( !u.activity && nova_bridge::wait_for_turn_action( u, m ) ) {
                         ++moves_since_last_save;
                         u.action_taken();
                     }
