@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import time
 import uuid
 from collections import deque
@@ -218,7 +217,6 @@ class WorldModel:
     blocked_edges: set[tuple[int, int, int, int, int, int]] = field(default_factory=set)
     active_goal_id: str = ""
     active_intention: str = ""
-    intention_age: int = 0
     progress_epoch: int = 0
     no_progress_streak: int = 0
     goal_no_progress: dict[str, int] = field(default_factory=dict)
@@ -302,7 +300,6 @@ class WorldModel:
             if goal_id:
                 self.goal_no_progress[goal_id] = self.goal_no_progress.get(goal_id, 0) + 1
 
-        self.intention_age += 1
 
     def visit_count_target(self, state: dict, dx: int, dy: int) -> int:
         x, y, z = pos_tuple(state)
@@ -322,6 +319,61 @@ class WorldModel:
         if r[-1] == r[-3] == r[-5] and r[-2] == r[-4]:
             return True
         return len(set(r[-8:])) <= 3 and len(r[-8:]) >= 6
+
+@dataclass
+class PlanStep:
+    kind: str
+    target: dict | None = None
+    params: dict = field(default_factory=dict)
+    completion: dict = field(default_factory=dict)
+    failure_count: int = 0
+    last_failure_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "params": self.params,
+            "completion": self.completion,
+            "failure_count": self.failure_count,
+            "last_failure_reason": self.last_failure_reason,
+        }
+
+@dataclass
+class Plan:
+    plan_id: str
+    goal_id: str
+    intention: str
+    steps: list[PlanStep]
+    step_index: int = 0
+    created_turn: int = 0
+    interruption_conditions: list[str] = field(default_factory=list)
+    planner_reason: str = ""
+    provenance: str = "qwen_plan"
+
+    @property
+    def current_step(self) -> PlanStep | None:
+        return self.steps[self.step_index] if self.step_index < len(self.steps) else None
+
+    @property
+    def completed(self) -> bool:
+        return self.current_step is None
+
+    def advance(self) -> None:
+        self.step_index += 1
+
+    def to_dict(self) -> dict:
+        return {
+            "plan_id": self.plan_id,
+            "goal_id": self.goal_id,
+            "intention": self.intention,
+            "step_index": self.step_index,
+            "created_turn": self.created_turn,
+            "interruption_conditions": self.interruption_conditions,
+            "planner_reason": self.planner_reason,
+            "provenance": self.provenance,
+            "steps": [step.to_dict() for step in self.steps],
+        }
 
 class ThoughtFeed:
     def __init__(self) -> None:
@@ -553,11 +605,6 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["wait_one_turn"],
             "priority": 0.10,
         })
-
-    if wm and wm.active_goal_id and wm.goal_no_progress.get(wm.active_goal_id, 0) >= 4:
-        alternatives = [g for g in candidates if g.get("goal_id") != wm.active_goal_id]
-        if alternatives:
-            candidates = alternatives
 
     if not candidates:
         candidates.append({
@@ -795,7 +842,6 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         "activity": state.get("activity"),
         "active_goal_id": wm.active_goal_id or None,
         "active_intention": wm.active_intention or None,
-        "intention_age_actions": wm.intention_age,
         "no_progress_streak": wm.no_progress_streak,
         "active_goal_no_progress": wm.goal_no_progress.get(wm.active_goal_id, 0),
         "goal_candidates": goal_candidates(state, actions, wm),
@@ -811,104 +857,301 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         },
     }
 
-def normalize_choice(raw: dict, allowed: list[dict]):
-    action = raw.get("action")
-    if not isinstance(action, str):
+def stable_direction_rank(dx: int, dy: int) -> int:
+    order = list(MOVE_DIRECTIONS.values())
+    try:
+        return order.index((dx, dy))
+    except ValueError:
+        return len(order)
+
+def current_turn(state: dict) -> int:
+    return int(state.get("turn", 0) or 0)
+
+def absolute_target_from_relative(state: dict, dx: int, dy: int) -> dict:
+    x, y, z = pos_tuple(state)
+    return {"x": x + dx, "y": y + dy, "z": z}
+
+def plan_step_complete_before_action(step: PlanStep, state: dict) -> bool:
+    if step.kind == "go_to" and step.target:
+        x, y, z = pos_tuple(state)
+        tx = int(step.target.get("x", x))
+        ty = int(step.target.get("y", y))
+        tz = int(step.target.get("z", z))
+        radius = int(step.params.get("arrival_radius", 0) or 0)
+        return z == tz and max(abs(tx - x), abs(ty - y)) <= radius
+    if step.kind == "rest":
+        stamina = int(state.get("stamina", 0) or 0)
+        stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+        return stamina / stamina_max >= float(step.params.get("until_ratio", 0.90))
+    return False
+
+def select_interaction(actions: list[dict], action_name: str,
+                       item_name: str | None = None,
+                       target: dict | None = None,
+                       state: dict | None = None) -> dict | None:
+    candidates = [a for a in actions if a.get("action") == action_name]
+    if item_name:
+        candidates = [a for a in candidates if a.get("item_name") == item_name]
+    if target and state and action_name in {"pickup_consumable", "open_adjacent"}:
+        x, y, _ = pos_tuple(state)
+        tx = int(target.get("x", x))
+        ty = int(target.get("y", y))
+        dx, dy = tx - x, ty - y
+        candidates = [a for a in candidates if a.get("dx") == dx and a.get("dy") == dy]
+    if not candidates:
         return None
-    for candidate in allowed:
-        if candidate.get("action") != action:
+    return max(
+        candidates,
+        key=lambda a: (
+            float(a.get("controller_score", 0.0)),
+            -int(a.get("visits_target", 0) or 0),
+            -stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+        ),
+    )
+
+def deterministic_move_toward(step: PlanStep, state: dict, actions: list[dict]) -> dict | None:
+    if not step.target:
+        return None
+    x, y, z = pos_tuple(state)
+    tx = int(step.target.get("x", x))
+    ty = int(step.target.get("y", y))
+    tz = int(step.target.get("z", z))
+    if z != tz:
+        return None
+    radius = int(step.params.get("arrival_radius", 0) or 0)
+    before = max(abs(tx - x), abs(ty - y))
+    if before <= radius:
+        return None
+
+    candidates = []
+    for action in actions:
+        if action.get("action") != "move_one_tile" or action.get("hostile_on_tile"):
             continue
-        if action in {"move_one_tile", "open_adjacent", "pickup_consumable"}:
-            try:
-                dx = int(raw.get("dx"))
-                dy = int(raw.get("dy"))
-            except Exception:
-                continue
-            if dx != candidate.get("dx") or dy != candidate.get("dy"):
-                continue
-        if action == "pickup_consumable":
-            if str(raw.get("item_name", "")) != str(candidate.get("item_name", "")):
-                continue
-        out = dict(candidate)
-        out["reason"] = str(raw.get("reason", ""))[:300]
-        try:
-            out["qwen_score"] = max(0.0, min(1.0, float(raw.get("score", 0.5))))
-        except Exception:
-            out["qwen_score"] = 0.5
-        if action == "sleep" and "duration_minutes" in raw:
-            try:
-                out["duration_minutes"] = max(10, min(720, int(raw["duration_minutes"])))
-            except Exception:
-                pass
-        return out
+        dx = int(action.get("dx", 0) or 0)
+        dy = int(action.get("dy", 0) or 0)
+        after = max(abs(tx - (x + dx)), abs(ty - (y + dy)))
+        if after >= before:
+            continue
+        candidates.append((after, int(action.get("visits_target", 0) or 0),
+                           stable_direction_rank(dx, dy), action))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1], row[2]))
+    choice = dict(candidates[0][3])
+    choice["reason"] = f"executor step toward committed target ({tx},{ty},{tz})"
+    choice["provenance"] = "plan_executor"
+    return choice
+
+def deterministic_explore_choice(step: PlanStep, actions: list[dict]) -> dict | None:
+    moves = [
+        a for a in actions
+        if a.get("action") == "move_one_tile" and not a.get("hostile_on_tile")
+    ]
+    if moves:
+        moves.sort(key=lambda a: (
+            int(a.get("visits_target", 0) or 0),
+            1 if a.get("immediate_backtrack") else 0,
+            -float(a.get("controller_score", 0.0)),
+            stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+        ))
+        choice = dict(moves[0])
+        choice["reason"] = "executor frontier step for committed explore plan"
+        choice["provenance"] = "plan_executor"
+        return choice
+
+    doors = [a for a in actions if a.get("action") == "open_adjacent"]
+    if doors:
+        doors.sort(key=lambda a: (
+            -float(a.get("controller_score", 0.0)),
+            stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+        ))
+        choice = dict(doors[0])
+        choice["reason"] = "executor opens boundary because local frontier is exhausted"
+        choice["provenance"] = "plan_executor"
+        return choice
     return None
 
-def candidate_serves_goal(candidate: dict, goal: dict) -> bool:
-    action = candidate.get("action")
-    goal_id = goal.get("goal_id")
-    supported = set(goal.get("supported_by") or [])
-    if action not in supported:
-        return False
+def execute_step(plan: Plan, state: dict, wm: WorldModel,
+                 actions: list[dict]) -> tuple[dict | None, str]:
+    step = plan.current_step
+    if step is None:
+        return None, "plan_complete"
 
-    if goal_id == "approach_consumable":
-        if action == "pickup_consumable":
-            return True
-        if action == "move_one_tile":
-            return int(candidate.get("resource_distance_delta", 0) or 0) > 0
-        return False
-    if goal_id == "acquire_consumable":
-        return action == "pickup_consumable"
-    if goal_id == "reduce_hunger":
-        return action == "eat_best_food"
+    if step.kind == "go_to":
+        choice = deterministic_move_toward(step, state, actions)
+        return choice, "committed go_to execution" if choice else "go_to_no_progress_action"
+
+    if step.kind == "consume":
+        action_name = str(step.params.get("action", ""))
+        choice = select_interaction(actions, action_name)
+        if choice:
+            choice = dict(choice)
+            choice["reason"] = f"executor performs committed {action_name}"
+            choice["provenance"] = "plan_executor"
+        return choice, f"committed consume step {action_name}"
+
+    if step.kind == "interact":
+        action_name = str(step.params.get("action", ""))
+        item_name = step.params.get("item_name")
+        choice = select_interaction(actions, action_name, item_name, step.target, state)
+        if choice:
+            choice = dict(choice)
+            choice["reason"] = f"executor performs committed interaction {action_name}"
+            choice["provenance"] = "plan_executor"
+        return choice, f"committed interact step {action_name}"
+
+    if step.kind == "rest":
+        choice = select_interaction(actions, "wait_one_turn")
+        if choice:
+            choice = dict(choice)
+            choice["reason"] = "executor continues committed rest until stamina target"
+            choice["provenance"] = "plan_executor"
+        return choice, "committed rest step"
+
+    if step.kind == "explore":
+        return deterministic_explore_choice(step, actions), "committed deterministic exploration"
+
+    return None, f"unsupported_plan_step:{step.kind}"
+
+def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
+                              actions: list[dict], planner_reason: str = "",
+                              provenance: str = "qwen_plan") -> Plan:
+    goal_id = str(goal.get("goal_id", "safe_progress"))
+    intention = str(goal.get("intention", "make grounded progress"))
+    steps: list[PlanStep] = []
+
     if goal_id == "reduce_thirst":
-        return action == "drink_best"
-    if goal_id == "recover_stamina":
-        return action == "wait_one_turn" and candidate.get("wait_reason") == "recover_stamina"
-    if goal_id == "reassess_stall":
-        return action == "wait_one_turn" and candidate.get("wait_reason") == "stalled"
-    if goal_id == "open_boundary":
-        return action == "open_adjacent"
-    if goal_id == "explore_frontier":
-        if action == "open_adjacent":
-            return True
-        return action == "move_one_tile" and int(candidate.get("visits_target", 0) or 0) == 0
-    return True
-
-def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict],
-                    replan: bool, trace_path: Path) -> tuple[list[dict], str, str, float, dict, int]:
-    world = compact_world(state, wm, actions)
-    instruction = (
-        "You are Nova, a persistent survivor inhabiting Cataclysm: Dark Days Ahead. "
-        "Reason like a competent person with continuity, not a stateless movement bot. "
-        "Use the situation summary, remembered recent positions/actions, and active intention. "
-        "A safe action is not automatically useful: prefer actions that make progress. "
-        "Repeated backtracking and pacing are bad unless there is a concrete reason. "
-        "A closed door while indoors may be an exit or access to unexplored space. "
-        "Visible food and drink can be acquired only when pickup_consumable is listed in allowed_actions. "
-        "When a visible storable consumable is not adjacent, movement choices include resource_distance_delta: "
-        "positive means the move gets closer, negative means farther away. Prefer getting closer when the active goal "
-        "is approach_consumable. "
-        "An active intention must be achievable with allowed_actions now. "
-        "Never invent an action that is not in allowed_actions. "
-        "Do not cite laptops, chargers, tools, furniture, or other non-actionable objects as reasons unless an allowed action can actually interact with them. "
-        "Return concise JSON only; do not narrate hidden chain-of-thought. "
-    )
-    if replan:
-        instruction += (
-            "Choose exactly one goal_id from goal_candidates. Do not invent a new goal and do not target "
-            "visible objects that cannot be acted on by the current allowed_actions. "
-        )
+        steps.append(PlanStep(
+            kind="consume",
+            params={"action": "drink_best"},
+            completion={"type": "consumed"},
+        ))
+    elif goal_id == "reduce_hunger":
+        steps.append(PlanStep(
+            kind="consume",
+            params={"action": "eat_best_food"},
+            completion={"type": "consumed"},
+        ))
+    elif goal_id == "approach_consumable":
+        target = dict(goal.get("target") or {})
+        if target:
+            abs_target = {
+                "x": int(target.get("gx", pos_tuple(state)[0] + int(target.get("dx", 0) or 0))),
+                "y": int(target.get("gy", pos_tuple(state)[1] + int(target.get("dy", 0) or 0))),
+                "z": int(target.get("gz", pos_tuple(state)[2])),
+            }
+            steps.append(PlanStep(
+                kind="go_to",
+                target=abs_target,
+                params={"arrival_radius": 1},
+                completion={"type": "arrived_near"},
+            ))
+            steps.append(PlanStep(
+                kind="interact",
+                target=abs_target,
+                params={"action": "pickup_consumable", "item_name": target.get("name")},
+                completion={"type": "pickup_verified", "item_name": target.get("name")},
+            ))
+    elif goal_id == "acquire_consumable":
+        pickups = [a for a in actions if a.get("action") == "pickup_consumable"]
+        if pickups:
+            pickups.sort(key=lambda a: (
+                -float(a.get("controller_score", 0.0)),
+                stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+            ))
+            p = pickups[0]
+            steps.append(PlanStep(
+                kind="interact",
+                target=absolute_target_from_relative(state, int(p.get("dx", 0)), int(p.get("dy", 0))),
+                params={"action": "pickup_consumable", "item_name": p.get("item_name")},
+                completion={"type": "pickup_verified", "item_name": p.get("item_name")},
+            ))
+    elif goal_id == "open_boundary":
+        doors = [a for a in actions if a.get("action") == "open_adjacent"]
+        if doors:
+            doors.sort(key=lambda a: (
+                -float(a.get("controller_score", 0.0)),
+                stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+            ))
+            d = doors[0]
+            steps.append(PlanStep(
+                kind="interact",
+                target=absolute_target_from_relative(state, int(d.get("dx", 0)), int(d.get("dy", 0))),
+                params={"action": "open_adjacent"},
+                completion={"type": "opened"},
+            ))
+            steps.append(PlanStep(
+                kind="explore",
+                params={"max_successful_moves": 4, "successful_moves": 0},
+                completion={"type": "explore_budget"},
+            ))
+    elif goal_id == "recover_stamina":
+        steps.append(PlanStep(
+            kind="rest",
+            params={"until_ratio": 0.90},
+            completion={"type": "stamina_ratio", "at_least": 0.90},
+        ))
+    elif goal_id == "reassess_stall":
+        steps.append(PlanStep(
+            kind="interact",
+            params={"action": "wait_one_turn"},
+            completion={"type": "waited_once"},
+        ))
     else:
-        instruction += (
-            "Keep serving active_goal_id unless safety or new evidence makes it clearly obsolete. "
-        )
-    instruction += (
-        'Schema: {"goal_id":"exact candidate id","choices":['
-        '{"action":"exact action","dx":0,"dy":0,"item_name":"exact visible item name","duration_minutes":480,'
-        '"score":0.0,"reason":"one short evidence-grounded reason"}]}. '
-        "Return up to 3 choices."
+        steps.append(PlanStep(
+            kind="explore",
+            params={"max_successful_moves": 6, "successful_moves": 0},
+            completion={"type": "explore_budget"},
+        ))
+
+    if not steps:
+        steps.append(PlanStep(
+            kind="explore",
+            params={"max_successful_moves": 4, "successful_moves": 0},
+            completion={"type": "explore_budget"},
+        ))
+
+    return Plan(
+        plan_id=uuid.uuid4().hex,
+        goal_id=goal_id,
+        intention=intention,
+        steps=steps[:5],
+        created_turn=current_turn(state),
+        interruption_conditions=[
+            "urgent_need_floor_crossing",
+            "hostile_within_5",
+            "current_step_failed_twice",
+            "current_step_unsupported",
+        ],
+        planner_reason=planner_reason,
+        provenance=provenance,
     )
 
+def compact_planner_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
+    base = compact_world(state, wm, actions)
+    base.pop("active_goal_id", None)
+    base.pop("active_intention", None)
+    base["planner_contract"] = {
+        "job": "choose one feasible goal, not a tile-level action",
+        "controller_executes_steps": True,
+        "maximum_plan_steps": 5,
+    }
+    return base
+
+def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
+              trace_path: Path) -> tuple[Plan, float, dict, int]:
+    goals = goal_candidates(state, actions, wm)
+    world = compact_planner_world(state, wm, actions)
+    instruction = (
+        "You are Nova's executive planner in Cataclysm: Dark Days Ahead. "
+        "Choose WHAT Nova should accomplish next, not which tile to step onto. "
+        "The deterministic executor handles movement and ordinary execution. "
+        "Choose exactly one goal_id from goal_candidates. "
+        "Use measured needs and feasible affordances only. "
+        "Do not invent goals or actions. "
+        "Return concise JSON only; do not narrate hidden chain-of-thought. "
+        'Schema: {"goal_id":"exact candidate id","intention":"short purpose","reason":"one short evidence-grounded reason"}.'
+    )
     payload = {
         "model": model,
         "stream": False,
@@ -917,132 +1160,203 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
             {"role": "system", "content": instruction},
             {"role": "user", "content": json.dumps(world, separators=(",", ":"))},
         ],
-        "options": {"temperature": 0.25},
+        "options": {"temperature": 0.20},
         "keep_alive": "30m",
     }
-    data, model_latency, ollama_metrics = ollama_chat_traced(payload, trace_path, timeout=180.0)
+    data, latency, metrics = ollama_chat_traced(payload, trace_path, timeout=180.0)
     parsed = json.loads(data.get("message", {}).get("content", "{}"))
-    raw_choice_count = len(parsed.get("choices", [])) if isinstance(parsed.get("choices", []), list) else 0
-    candidates = goal_candidates(state, actions, wm)
-    by_id = {g["goal_id"]: g for g in candidates}
-    proposed_goal_id = str(parsed.get("goal_id", "")).strip()
-    if not replan and wm.active_goal_id in by_id:
-        chosen_goal = by_id[wm.active_goal_id]
+    by_id = {g["goal_id"]: g for g in goals}
+    proposed = str(parsed.get("goal_id", "")).strip()
+    chosen = by_id.get(proposed)
+    provenance = "qwen_plan"
+    if chosen is None:
+        chosen = choose_fallback_goal(goals)
+        provenance = "planner_fallback"
+    reason = str(parsed.get("reason", "")).strip()[:300]
+    intention = str(parsed.get("intention", "")).strip()[:180]
+    if intention:
+        chosen = dict(chosen)
+        chosen["intention"] = intention
+    plan = synthesize_plan_from_goal(
+        chosen, state, wm, actions,
+        planner_reason=reason or "Qwen selected a feasible goal without a reason string",
+        provenance=provenance,
+    )
+    return plan, latency, metrics, 1
+
+def fallback_plan(state: dict, wm: WorldModel, actions: list[dict],
+                  reason: str = "planner unavailable") -> Plan:
+    goals = goal_candidates(state, actions, wm)
+    goal = choose_fallback_goal(goals)
+    return synthesize_plan_from_goal(
+        goal, state, wm, actions,
+        planner_reason=reason,
+        provenance="planner_fallback",
+    )
+
+def safety_plan(state: dict, actions: list[dict], safety: tuple[dict, str]) -> Plan:
+    action, reason = safety
+    if action.get("action") == "drink_best":
+        goal = {"goal_id": "reduce_thirst", "intention": "drink something safe to reduce urgent thirst"}
+    elif action.get("action") == "eat_best_food":
+        goal = {"goal_id": "reduce_hunger", "intention": "eat something safe to reduce urgent hunger"}
     else:
-        chosen_goal = by_id.get(proposed_goal_id)
-        if chosen_goal is None:
-            chosen_goal = choose_fallback_goal(candidates)
+        goal = {"goal_id": "recover_stamina", "intention": "rest because stamina is critically low"}
+    return synthesize_plan_from_goal(goal, state, WorldModel(), actions,
+                                    planner_reason=reason, provenance="safety_plan")
 
-    compatible = [a for a in actions if candidate_serves_goal(a, chosen_goal)]
-    if not compatible:
-        viable_goals = [
-            g for g in candidates
-            if any(candidate_serves_goal(a, g) for a in actions)
-        ]
-        chosen_goal = choose_fallback_goal(viable_goals or candidates)
+def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
+                          actions: list[dict]) -> str | None:
+    step = plan.current_step
+    if step is None:
+        return "plan_complete"
 
-    intention = str(chosen_goal["intention"])
-    goal_id = str(chosen_goal["goal_id"])
-    choices = []
-    represented = set()
-    for raw in parsed.get("choices", [])[:3]:
-        if isinstance(raw, dict):
-            valid = normalize_choice(raw, actions)
-            if valid and candidate_serves_goal(valid, chosen_goal):
-                # Hybrid executive score: Qwen judgment + grounded progress utility.
-                qs = float(valid.get("qwen_score", 0.5))
-                cs = float(valid.get("controller_score", 0.5))
-                goal_bonus = 0.0
-                if goal_id == "approach_consumable":
-                    delta = int(valid.get("resource_distance_delta", 0) or 0)
-                    if valid.get("action") == "pickup_consumable":
-                        goal_bonus += 0.30
-                    elif valid.get("action") == "move_one_tile" and delta > 0:
-                        goal_bonus += 0.24
-                    elif valid.get("action") == "move_one_tile" and delta < 0:
-                        goal_bonus -= 0.35
-                elif goal_id == "acquire_consumable" and valid.get("action") == "pickup_consumable":
-                    goal_bonus += 0.30
-                elif goal_id == "reduce_hunger" and valid.get("action") == "eat_best_food":
-                    goal_bonus += 0.30
-                elif goal_id == "reduce_thirst" and valid.get("action") == "drink_best":
-                    goal_bonus += 0.30
-                valid["goal_bonus"] = goal_bonus
-                valid["combined_score"] = max(0.0, min(1.0, 0.65 * qs + 0.35 * cs + goal_bonus))
-                valid["provenance"] = "qwen"
-                choices.append(valid)
-                represented.add((valid.get("action"), valid.get("dx"), valid.get("dy"), valid.get("item_name")))
+    safety = deterministic_safety(state, actions)
+    if safety:
+        safety_action = safety[0].get("action")
+        expected = {
+            "reduce_thirst": "drink_best",
+            "reduce_hunger": "eat_best_food",
+            "recover_stamina": "wait_one_turn",
+        }.get(plan.goal_id)
+        if safety_action != expected:
+            return f"urgent_need_override:{safety_action}"
 
-    # Do not let Qwen accidentally hide a highly meaningful grounded option.
-    # Unmentioned legal actions remain candidates with a modest model prior.
-    for candidate in actions:
-        if not candidate_serves_goal(candidate, chosen_goal):
+    hostiles = [
+        c for c in state.get("nearby_creatures", [])
+        if str(c.get("attitude", "")).lower() == "hostile"
+        and max(abs(int(c.get("dx", 99) or 99)), abs(int(c.get("dy", 99) or 99))) <= 5
+    ]
+    if hostiles:
+        return "hostile_within_5"
+
+    if step.failure_count >= 2:
+        return "current_step_failed_twice"
+
+    if step.kind == "consume":
+        if not any(a.get("action") == step.params.get("action") for a in actions):
+            return "current_step_unsupported"
+    if step.kind == "interact":
+        action_name = step.params.get("action")
+        item_name = step.params.get("item_name")
+        if select_interaction(actions, action_name, item_name, step.target, state) is None:
+            return "current_step_unsupported"
+    return None
+
+def consumable_counts(state: dict, predicate) -> dict[tuple[str, int, int], int]:
+    counts: dict[tuple[str, int, int], int] = {}
+    for item in state.get("inventory_consumables", []):
+        if not predicate(item):
             continue
-        key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"), candidate.get("item_name"))
-        if key in represented:
-            continue
-        extra = dict(candidate)
-        extra["qwen_score"] = 0.35
-        extra["reason"] = "grounded controller candidate"
-        cs = float(extra.get("controller_score", 0.5))
-        goal_bonus = 0.0
-        if goal_id == "approach_consumable":
-            delta = int(extra.get("resource_distance_delta", 0) or 0)
-            if extra.get("action") == "pickup_consumable":
-                goal_bonus += 0.30
-            elif extra.get("action") == "move_one_tile" and delta > 0:
-                goal_bonus += 0.24
-            elif extra.get("action") == "move_one_tile" and delta < 0:
-                goal_bonus -= 0.35
-        elif goal_id == "acquire_consumable" and extra.get("action") == "pickup_consumable":
-            goal_bonus += 0.30
-        elif goal_id == "reduce_hunger" and extra.get("action") == "eat_best_food":
-            goal_bonus += 0.30
-        elif goal_id == "reduce_thirst" and extra.get("action") == "drink_best":
-            goal_bonus += 0.30
-        extra["goal_bonus"] = goal_bonus
-        extra["combined_score"] = max(0.0, min(1.0, 0.65 * 0.35 + 0.35 * cs + goal_bonus))
-        extra["provenance"] = "controller_generated"
-        choices.append(extra)
+        key = (
+            str(item.get("name", "")),
+            int(item.get("nutrition", 0) or 0),
+            int(item.get("quench", 0) or 0),
+        )
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
-    return choices, goal_id, intention, model_latency, ollama_metrics, raw_choice_count
+def inventory_consumable_changed(before: dict, after: dict, mode: str) -> tuple[bool, dict]:
+    if mode == "eat":
+        predicate = lambda x: int(x.get("nutrition", 0) or 0) > 0
+    else:
+        predicate = lambda x: int(x.get("quench", 0) or 0) > 0
+    b = consumable_counts(before, predicate)
+    a = consumable_counts(after, predicate)
+    changed = any(a.get(key, 0) < count for key, count in b.items())
+    return changed, {"before": b, "after": a}
 
-def choose_with_variation(choices: list[dict]):
-    if not choices:
-        return None
-    choices = sorted(choices, key=lambda x: float(x.get("combined_score", 0.0)), reverse=True)
-    top = float(choices[0].get("combined_score", 0.0))
-    close = [c for c in choices if float(c.get("combined_score", 0.0)) >= top - 0.08]
-    weights = [max(0.02, float(c.get("combined_score", 0.05))) for c in close]
-    return random.choices(close, weights=weights, k=1)[0]
+def verify_step(plan: Plan, action: dict, outcome: str, before: dict,
+                after: dict, result: dict | None) -> tuple[bool, bool, dict]:
+    step = plan.current_step
+    if step is None:
+        return True, True, {"evidence": "plan_already_complete"}
 
-def fallback_choice(state: dict, wm: WorldModel, actions: list[dict]):
-    # Highest grounded progress score; not random pacing.
-    sane = [a for a in actions if not a.get("hostile_on_tile")]
-    if not sane:
-        sane = actions
-    choice = max(sane, key=lambda a: float(a.get("controller_score", 0.0)))
-    return choice, "controller fallback: highest grounded progress"
+    if step.kind == "go_to":
+        bx, by, bz = pos_tuple(before)
+        ax, ay, az = pos_tuple(after)
+        tx = int((step.target or {}).get("x", ax))
+        ty = int((step.target or {}).get("y", ay))
+        tz = int((step.target or {}).get("z", az))
+        radius = int(step.params.get("arrival_radius", 0) or 0)
+        before_d = max(abs(tx - bx), abs(ty - by)) if bz == tz else 10**9
+        after_d = max(abs(tx - ax), abs(ty - ay)) if az == tz else 10**9
+        progress = outcome == "moved" and after_d < before_d
+        complete = after_d <= radius
+        return progress, complete, {
+            "evidence": "distance_to_target",
+            "before_distance": before_d,
+            "after_distance": after_d,
+            "target": step.target,
+        }
 
-def should_replan(wm: WorldModel, situation: dict, state: dict, actions: list[dict]) -> bool:
-    if not wm.active_intention or not wm.active_goal_id:
-        return True
-    candidates = goal_candidates(state, actions, wm)
-    by_id = {g["goal_id"]: g for g in candidates}
-    active = by_id.get(wm.active_goal_id)
-    if active is None or not goal_still_supported(wm, actions, state):
-        return True
-    if wm.goal_no_progress.get(wm.active_goal_id, 0) >= 4:
-        return True
-    best_priority = max(float(g.get("priority", 0.0)) for g in candidates)
-    active_priority = float(active.get("priority", 0.0))
-    if best_priority >= active_priority + 0.08:
-        return True
-    if wm.intention_age >= 12:
-        return True
-    if situation.get("loop_detected"):
-        return True
-    return False
+    if step.kind == "explore":
+        moved = outcome == "moved" and pos_tuple(before) != pos_tuple(after)
+        if moved:
+            step.params["successful_moves"] = int(step.params.get("successful_moves", 0) or 0) + 1
+        complete = int(step.params.get("successful_moves", 0) or 0) >= int(
+            step.params.get("max_successful_moves", 6) or 6
+        )
+        return moved or outcome == "opened", complete, {
+            "evidence": "explore_progress",
+            "successful_moves": step.params.get("successful_moves", 0),
+            "target_moves": step.params.get("max_successful_moves", 6),
+        }
+
+    if step.kind == "interact":
+        action_name = step.params.get("action")
+        if action_name == "pickup_consumable":
+            verified = outcome == "pickup_verified"
+            return verified, verified, {
+                "evidence": "native_pickup_verified",
+                "item_name": step.params.get("item_name"),
+                "outcome": outcome,
+            }
+        if action_name == "open_adjacent":
+            verified = outcome == "opened"
+            return verified, verified, {"evidence": "native_opened", "outcome": outcome}
+        if action_name == "wait_one_turn":
+            verified = outcome == "waited"
+            return verified, verified, {"evidence": "waited_once", "outcome": outcome}
+        return False, False, {"evidence": "unsupported_interaction_verifier"}
+
+    if step.kind == "consume":
+        mode = "eat" if step.params.get("action") == "eat_best_food" else "drink"
+        changed, inventory_evidence = inventory_consumable_changed(before, after, mode)
+        activity_complete = str(after.get("activity", "") or "") == ""
+        started = outcome == "consume_activity_started"
+        verified = started and activity_complete and changed
+        return verified, verified, {
+            "evidence": "consume_activity_completed_and_inventory_changed",
+            "mode": mode,
+            "activity_started": started,
+            "post_activity": activity_complete,
+            "inventory_changed": changed,
+            "inventory_evidence": inventory_evidence,
+            "physiology": {
+                "hunger_before": before.get("hunger"),
+                "hunger_after": after.get("hunger"),
+                "thirst_before": before.get("thirst"),
+                "thirst_after": after.get("thirst"),
+                "stored_kcal_before": before.get("stored_kcal"),
+                "stored_kcal_after": after.get("stored_kcal"),
+            },
+        }
+
+    if step.kind == "rest":
+        b = int(before.get("stamina", 0) or 0)
+        a = int(after.get("stamina", 0) or 0)
+        maximum = max(1, int(after.get("stamina_max", 1) or 1))
+        progress = outcome == "waited" and a > b
+        complete = a / maximum >= float(step.params.get("until_ratio", 0.90))
+        return progress, complete, {
+            "evidence": "stamina_recovery",
+            "before": b,
+            "after": a,
+            "target_ratio": step.params.get("until_ratio", 0.90),
+        }
+
+    return False, False, {"evidence": f"no_verifier_for_{step.kind}"}
 
 def concise_action(choice: dict) -> str:
     return choice.get("label") or choice.get("action", "act")
@@ -1066,9 +1380,9 @@ def main() -> int:
     wm = WorldModel()
     feed = ThoughtFeed()
 
-    print("NOVA CDDA COGNITION + UI BETA")
+    print("NOVA CDDA PLANNER + EXECUTOR VALIDATION")
     print(f"Run target: {RUN_MINUTES} minutes")
-    print(f"Ollama model: {model or 'NOT FOUND - grounded controller fallback'}")
+    print(f"Ollama model: {model or 'NOT FOUND - deterministic planner fallback'}")
     print(f"Log: {log_path}")
     print(f"Model trace: {model_trace_path}")
     print()
@@ -1089,22 +1403,17 @@ def main() -> int:
     if MODEL_AUDIT:
         actions = available_actions(state, wm)
         print()
-        print("MODEL AUDIT: sending one real gameplay-state request to Ollama...")
+        print("MODEL AUDIT: sending two real planning requests to Ollama...")
         try:
-            first = qwen_deliberate(model, state, wm, actions, True, model_trace_path)
-            options1, goal_id1, intention1, latency1, metrics1, raw_count1 = first
+            first = qwen_plan(model, state, wm, actions, model_trace_path)
+            plan1, latency1, metrics1, raw_count1 = first
             time.sleep(1.0)
-            second = qwen_deliberate(model, state, wm, actions, True, model_trace_path)
-            options2, goal_id2, intention2, latency2, metrics2, raw_count2 = second
+            second = qwen_plan(model, state, wm, actions, model_trace_path)
+            plan2, latency2, metrics2, raw_count2 = second
         except Exception as exc:
             print(f"MODEL AUDIT FAILED: {exc!r}")
             print(f"Trace: {model_trace_path}")
             return 3
-
-        qwen_valid1 = sum(1 for x in options1 if x.get("provenance") == "qwen")
-        controller_added1 = sum(1 for x in options1 if x.get("provenance") == "controller_generated")
-        qwen_valid2 = sum(1 for x in options2 if x.get("provenance") == "qwen")
-        controller_added2 = sum(1 for x in options2 if x.get("provenance") == "controller_generated")
 
         print("MODEL AUDIT PASSED")
         print(f"Endpoint: {OLLAMA}/api/chat")
@@ -1112,12 +1421,10 @@ def main() -> int:
         print("keep_alive: 30m")
         print()
         print(f"CALL 1 latency: {latency1:.3f}s | Ollama load: {metrics1.get('load_duration_seconds')}s")
-        print(f"CALL 1 raw Qwen choices: {raw_count1} | validated Qwen: {qwen_valid1} | controller-added: {controller_added1} | final pool: {len(options1)}")
-        print(f"CALL 1 goal_id: {goal_id1}")
+        print(f"CALL 1 goal_id: {plan1.goal_id} | steps: {[s.kind for s in plan1.steps]}")
         print()
         print(f"CALL 2 latency: {latency2:.3f}s | Ollama load: {metrics2.get('load_duration_seconds')}s")
-        print(f"CALL 2 raw Qwen choices: {raw_count2} | validated Qwen: {qwen_valid2} | controller-added: {controller_added2} | final pool: {len(options2)}")
-        print(f"CALL 2 goal_id: {goal_id2}")
+        print(f"CALL 2 goal_id: {plan2.goal_id} | steps: {[s.kind for s in plan2.steps]}")
         print()
         print(f"Raw request/response trace: {model_trace_path}")
         print("No game action was dispatched in audit mode.")
@@ -1125,108 +1432,114 @@ def main() -> int:
 
     deadline = time.monotonic() + RUN_MINUTES * 60
     action_count = 0
+    plan: Plan | None = None
 
     while time.monotonic() < deadline:
         sit = situation_summary(state, wm)
         actions = available_actions(state, wm)
         safety = deterministic_safety(state, actions)
-        model_error = None
-        model_latency_seconds = None
-        model_metrics = None
-        model_raw_choice_count = None
-        decision_mode = None
-        selected_provenance = None
-        replan = should_replan(wm, sit, state, actions)
 
         feed.push("SEE: " + describe_situation(sit))
 
-        stall_only = (
-            len(actions) == 1
-            and actions[0].get("action") == "wait_one_turn"
-            and actions[0].get("wait_reason") == "stalled"
-        )
-        if stall_only and wm.no_progress_streak >= 2:
+        if plan and plan.completed:
             append_log(log_path, {
                 "wall_time": utc_now(),
-                "validation_stop": "stalled_no_progress",
+                "plan_event": "completed",
+                "plan": plan.to_dict(),
                 "position": state.get("position"),
-                "stamina": state.get("stamina"),
-                "stamina_max": state.get("stamina_max"),
-                "known_blocked_edges": len(wm.blocked_edges),
-                "no_progress_streak": wm.no_progress_streak,
             })
-            feed.push("STOP: no safe local progress after blocked-edge reassessment.")
-            print("VALIDATION STOP: no safe local progress after blocked-edge reassessment.")
-            break
+            feed.push("PLAN: completed " + plan.goal_id)
+            plan = None
+            wm.active_goal_id = ""
+            wm.active_intention = ""
+            continue
 
-        if safety:
-            choice, reason = safety
-            decision_mode = "safety"
-            selected_provenance = "safety"
-            intention = wm.active_intention or "stay alive and stabilize immediate needs"
-            feed.push("INTENT: " + intention)
-        else:
-            choice = None
-            reason = ""
-            intention = wm.active_intention
+        if plan:
+            interrupt_reason = should_interrupt_plan(plan, state, wm, actions)
+            if interrupt_reason:
+                append_log(log_path, {
+                    "wall_time": utc_now(),
+                    "plan_event": "interrupted",
+                    "reason": interrupt_reason,
+                    "plan": plan.to_dict(),
+                    "position": state.get("position"),
+                })
+                feed.push("PLAN: interrupted — " + interrupt_reason)
+                plan = None
+                wm.active_goal_id = ""
+                wm.active_intention = ""
+                continue
 
-            if stall_only:
-                choice = dict(actions[0])
-                decision_mode = "stall_reassess"
-                selected_provenance = "controller_stall_guard"
-                wm.active_goal_id = "reassess_stall"
-                wm.active_intention = "wait once and reassess because no safe local movement is currently available"
-                intention = wm.active_intention
-                reason = "deterministic one-turn reassessment; stamina is not being claimed as low"
-            elif not needs_qwen_judgment(state, wm, actions):
-                choice = fast_frontier_choice(state, wm, actions)
-                if choice:
-                    decision_mode = "fast_frontier"
-                    selected_provenance = "controller_fast_path"
-                    wm.active_goal_id = "explore_frontier"
-                    wm.active_intention = "explore nearby unvisited space and update the local map"
-                    intention = wm.active_intention
-                    reason = choice.get("reason", "")
+        if plan is None:
+            model_error = None
+            model_latency_seconds = None
+            model_metrics = None
 
-            if choice is None and model:
+            if safety:
+                plan = safety_plan(state, actions, safety)
+            elif model:
                 try:
-                    options, proposed_goal_id, proposed_intention, model_latency_seconds, model_metrics, model_raw_choice_count = qwen_deliberate(
-                        model, state, wm, actions, replan, model_trace_path
+                    plan, model_latency_seconds, model_metrics, _ = qwen_plan(
+                        model, state, wm, actions, model_trace_path
                     )
-                    if replan:
-                        wm.active_goal_id = proposed_goal_id
-                        wm.active_intention = proposed_intention
-                        wm.intention_age = 0
-                    elif not wm.active_intention:
-                        wm.active_goal_id = proposed_goal_id
-                        wm.active_intention = proposed_intention
-                    intention = wm.active_intention
-                    choice = choose_with_variation(options)
-                    if choice:
-                        decision_mode = "qwen"
-                        selected_provenance = choice.get("provenance")
-                        if choice.get("reason"):
-                            reason = choice.get("reason")
-                        elif selected_provenance == "qwen":
-                            reason = "Qwen returned this legal choice without a reason string"
-                        else:
-                            reason = "controller-generated grounded candidate selected after Qwen deliberation"
                 except Exception as exc:
                     model_error = repr(exc)
+                    plan = fallback_plan(state, wm, actions, reason=f"planner error: {model_error}")
+            else:
+                plan = fallback_plan(state, wm, actions)
 
-            if not choice:
-                choice, reason = fallback_choice(state, wm, actions)
-                decision_mode = "fallback"
-                selected_provenance = "fallback"
-                if not wm.active_intention:
-                    fallback_goal = choose_fallback_goal(goal_candidates(state, actions, wm))
-                    wm.active_goal_id = fallback_goal["goal_id"]
-                    wm.active_intention = fallback_goal["intention"]
-                intention = wm.active_intention
+            wm.active_goal_id = plan.goal_id
+            wm.active_intention = plan.intention
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "plan_event": "created",
+                "plan": plan.to_dict(),
+                "model": model,
+                "model_error": model_error,
+                "model_latency_seconds": (
+                    round(model_latency_seconds, 3) if model_latency_seconds is not None else None
+                ),
+                "model_metrics": model_metrics,
+                "position": state.get("position"),
+            })
+            feed.push("INTENT: " + plan.intention)
 
-            feed.push("INTENT: " + (intention or "make grounded progress"))
+        # A step can already be complete when the previous step placed Nova at
+        # its completion boundary. Advance without spending a game action.
+        while plan and plan.current_step and plan_step_complete_before_action(plan.current_step, state):
+            completed_step = plan.current_step.to_dict()
+            plan.advance()
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "plan_event": "step_completed_without_dispatch",
+                "completed_step": completed_step,
+                "plan": plan.to_dict(),
+                "position": state.get("position"),
+            })
+            if plan.completed:
+                break
 
-        feed.push(f"DO: {concise_action(choice)} — {reason}")
+        if plan is None or plan.completed:
+            continue
+
+        step = plan.current_step
+        choice, executor_reason = execute_step(plan, state, wm, actions)
+        if not choice:
+            step.failure_count += 1
+            step.last_failure_reason = executor_reason
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "plan_event": "step_no_action",
+                "reason": executor_reason,
+                "plan": plan.to_dict(),
+                "state": state,
+            })
+            feed.push("PLAN: step blocked — " + executor_reason)
+            if step.failure_count >= 2:
+                plan = None
+                wm.active_goal_id = ""
+                wm.active_intention = ""
+            continue
 
         action = choice["action"]
         if action not in VALIDATION_DISPATCH_ALLOWLIST:
@@ -1239,11 +1552,14 @@ def main() -> int:
                 "action_index": action_count + 1,
                 "blocked_dispatch": action,
                 "command_error": command_error,
+                "plan": plan.to_dict(),
             })
             feed.push("BLOCKED: excluded validation action " + str(action))
             print(command_error)
             break
 
+        feed.push(f"DO: {concise_action(choice)} — {executor_reason}")
+        state_before = state
         started = time.monotonic()
         try:
             result = send_command(action, timeout=60.0, **command_kwargs(choice))
@@ -1254,53 +1570,25 @@ def main() -> int:
 
         action_count += 1
         outcome = result.get("outcome") if result else "command_error"
-
-        if result:
-            feed.push(f"RESULT: {outcome}.")
-        else:
-            feed.push("ERROR: action did not return a result.")
-
-        record = {
-            "wall_time": utc_now(),
-            "action_index": action_count,
-            "model": model,
-            "decision_mode": decision_mode,
-            "selected_provenance": selected_provenance,
-            "model_raw_choice_count": model_raw_choice_count,
-            "model_metrics": model_metrics,
-            "situation": sit,
-            "active_goal_id": wm.active_goal_id,
-            "active_intention": wm.active_intention,
-            "replanned": replan,
-            "selected": choice,
-            "reason": reason,
-            "model_error": model_error,
-            "command_error": command_error,
-            "state_before": state,
-            "result": result,
-            "bridge_latency_seconds": round(time.monotonic() - started, 3),
-            "model_latency_seconds": (
-                round(model_latency_seconds, 3) if model_latency_seconds is not None else None
-            ),
-            "world_model": {
-                "visited_positions": len(wm.visits),
-                "known_tiles": len(wm.known_tiles),
-                "loop_detected": wm.looping(),
-                "known_blocked_edges": len(wm.blocked_edges),
-                "no_progress_streak": wm.no_progress_streak,
-                "active_goal_no_progress": wm.goal_no_progress.get(wm.active_goal_id, 0),
-            },
-        }
-        append_log(log_path, record)
+        bridge_latency = round(time.monotonic() - started, 3)
 
         if command_error:
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "action_index": action_count,
+                "command_error": command_error,
+                "selected": choice,
+                "plan": plan.to_dict(),
+                "state_before": state_before,
+                "bridge_latency_seconds": bridge_latency,
+            })
             print(f"[{action_count}] {action}: COMMAND ERROR {command_error}")
             break
 
-        print(f"[{action_count}] {action}: {outcome} | mode={decision_mode} | goal={wm.active_intention!r} | {reason[:90]}")
-        wm.record_action(state, choice, outcome, result)
+        wm.record_action(state_before, choice, outcome, result)
 
-        previous_state = state
+        # Option A activity contract: with the native C++ gate, this observe
+        # should not be serviced until the current activity has completed.
         try:
             obs = send_command("observe", timeout=900.0)
             state = state_from_response(obs)
@@ -1311,62 +1599,74 @@ def main() -> int:
             print(f"Observe failed: {exc}")
             break
 
-        verification = None
-        if action == "pickup_consumable":
-            verification = {
-                "verified": int(state.get("inventory_count", 0) or 0) >
-                            int(previous_state.get("inventory_count", 0) or 0),
-                "evidence": "inventory_count_increase",
-                "before": previous_state.get("inventory_count"),
-                "after": state.get("inventory_count"),
-            }
-        elif action == "eat_best_food":
-            before_hunger = int(previous_state.get("hunger", 0) or 0)
-            after_hunger = int(state.get("hunger", 0) or 0)
-            before_kcal = int(previous_state.get("stored_kcal", 0) or 0)
-            after_kcal = int(state.get("stored_kcal", 0) or 0)
-            hunger_delta = before_hunger - after_hunger
-            kcal_delta = after_kcal - before_kcal
-            verification = {
-                "verified": (
-                    hunger_delta >= MIN_HUNGER_IMPROVEMENT
-                    or kcal_delta >= MIN_STORED_KCAL_IMPROVEMENT
-                ),
-                "evidence": "meaningful_hunger_down_or_stored_kcal_up",
-                "minimum_hunger_improvement": MIN_HUNGER_IMPROVEMENT,
-                "minimum_kcal_improvement": MIN_STORED_KCAL_IMPROVEMENT,
-                "hunger_delta": hunger_delta,
-                "kcal_delta": kcal_delta,
-                "before_hunger": before_hunger,
-                "after_hunger": after_hunger,
-                "before_kcal": before_kcal,
-                "after_kcal": after_kcal,
-            }
-        elif action == "drink_best":
-            before_thirst = int(previous_state.get("thirst", 0) or 0)
-            after_thirst = int(state.get("thirst", 0) or 0)
-            thirst_delta = before_thirst - after_thirst
-            verification = {
-                "verified": thirst_delta >= MIN_THIRST_IMPROVEMENT,
-                "evidence": "meaningful_thirst_decrease",
-                "minimum_thirst_improvement": MIN_THIRST_IMPROVEMENT,
-                "thirst_delta": thirst_delta,
-                "before": before_thirst,
-                "after": after_thirst,
-            }
+        progress, step_complete, verification = verify_step(
+            plan, choice, outcome, state_before, state, result
+        )
+        verification["post_activity_contract"] = (
+            str(state.get("activity", "") or "") == ""
+            if action in {"eat_best_food", "drink_best"}
+            else None
+        )
 
-        if verification is not None:
+        step = plan.current_step
+        if progress:
+            step.failure_count = 0
+            step.last_failure_reason = ""
+        else:
+            step.failure_count += 1
+            step.last_failure_reason = str(verification.get("evidence", outcome))
+
+        if step_complete:
+            completed_step = step.to_dict()
+            plan.advance()
+            plan_event = "step_completed"
+        else:
+            completed_step = None
+            plan_event = "step_progress" if progress else "step_failed"
+
+        append_log(log_path, {
+            "wall_time": utc_now(),
+            "action_index": action_count,
+            "decision_mode": "plan_executor",
+            "selected_provenance": choice.get("provenance", "plan_executor"),
+            "selected": choice,
+            "reason": executor_reason,
+            "active_goal_id": plan.goal_id,
+            "active_intention": plan.intention,
+            "plan_event": plan_event,
+            "plan": plan.to_dict(),
+            "completed_step": completed_step,
+            "state_before": state_before,
+            "result": result,
+            "state_after": state,
+            "verification": verification,
+            "bridge_latency_seconds": bridge_latency,
+            "world_model": {
+                "visited_positions": len(wm.visits),
+                "known_tiles": len(wm.known_tiles),
+                "loop_detected": wm.looping(),
+                "known_blocked_edges": len(wm.blocked_edges),
+            },
+        })
+
+        feed.push(("VERIFIED: " if step_complete else "RESULT: ") + f"{action} — {verification.get('evidence')}")
+        print(
+            f"[{action_count}] {action}: {outcome} | mode=plan_executor | "
+            f"goal={plan.goal_id!r} | step={step.kind!r} | "
+            f"{verification.get('evidence')}"
+        )
+
+        if step.failure_count >= 2:
             append_log(log_path, {
                 "wall_time": utc_now(),
-                "verification_for_action": action_count,
-                "action": action,
-                "completion_evidence": verification,
+                "plan_event": "step_failure_limit",
+                "plan": plan.to_dict(),
+                "position": state.get("position"),
             })
-            feed.push(
-                ("VERIFIED: " if verification["verified"] else "UNVERIFIED: ")
-                + action + " — " + verification["evidence"]
-            )
-
+            feed.push("PLAN: abandoned after repeated step failure.")
+            plan = None
+            wm.active_goal_id = ""
+            wm.active_intention = ""
 
     feed.push(f"SESSION: finished after {action_count} actions.")
     print()
