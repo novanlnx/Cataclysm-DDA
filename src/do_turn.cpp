@@ -689,19 +689,58 @@ static bool wait_for_turn_action( avatar &u, map &m )
                 continue;
             }
 
-            // Nova bridge actions must never block on an interactive confirmation
-            // dialog. Native movement can prompt before entering dangerous terrain
-            // (for example "Really step into rose bush?"). Treat that destination
-            // as a blocked edge and let the controller choose another route.
+            // Nova bridge actions must never enter a native UI path that waits
+            // for a human confirmation/menu response. Reject those situations as
+            // ordinary blocked edges so the controller can reason and choose again.
             const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
-            if( m.inbounds( target ) && g->is_dangerous_tile( target ) ) {
+            if( !m.inbounds( target ) ) {
                 write_response( dir, command_id, action, false, "blocked",
                                 before, before, false, false,
-                                "dangerous_tile_requires_confirmation" );
+                                "target_out_of_bounds" );
+                continue;
+            }
+            if( g->is_dangerous_tile( target ) ) {
+                write_response( dir, command_id, action, false, "blocked",
+                                before, before, false, false,
+                                "dangerous_tile_requires_decision" );
+                continue;
+            }
+            if( get_creature_tracker().creature_at( target ) != nullptr ) {
+                write_response( dir, command_id, action, false, "blocked",
+                                before, before, false, false,
+                                "occupied_tile_requires_interaction" );
+                continue;
+            }
+            const bool deep_water =
+                m.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, target ) &&
+                !m.has_flag_furn( "BRIDGE", target );
+            if( deep_water ) {
+                write_response( dir, command_id, action, false, "blocked",
+                                before, before, false, false,
+                                "deep_water_requires_decision" );
+                continue;
+            }
+            if( m.veh_at( u.pos_bub() ) || m.veh_at( target ) ) {
+                write_response( dir, command_id, action, false, "blocked",
+                                before, before, false, false,
+                                "vehicle_interaction_not_exposed" );
+                continue;
+            }
+            if( u.is_mounted() || u.get_grab_type() != object_type::NONE ) {
+                write_response( dir, command_id, action, false, "blocked",
+                                before, before, false, false,
+                                "movement_context_requires_interaction" );
                 continue;
             }
 
+            // Safe mode is a human-facing confirmation layer. Nova already sees
+            // nearby hostiles in structured state and applies its own threat tier,
+            // so temporarily disable the UI safeguard for this one native move to
+            // prevent post-step auto-peek/look-around dialogs from blocking IPC.
+            const safe_mode_type previous_safe_mode = g->safe_mode;
+            g->set_safe_mode( SAFE_MODE_OFF );
             const bool handled = avatar_action::move( u, m, tripoint_rel_ms( dx, dy, 0 ) );
+            g->set_safe_mode( previous_safe_mode );
             const state_snapshot after = snapshot( u );
             const bool position_changed = before.x != after.x || before.y != after.y || before.z != after.z;
             const std::string outcome = position_changed ? "moved" :
