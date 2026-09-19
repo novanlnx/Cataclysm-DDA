@@ -1,0 +1,104 @@
+NOVA — RECENT TEST AND MODEL EVIDENCE
+Date: 2026-09-19
+
+MODEL AUDIT
+Endpoint: http://127.0.0.1:11434/api/chat
+Model: qwen2.5:7b
+keep_alive: 30m
+
+Call 1:
+- client latency: 29.250 s
+- Ollama load_duration: 18.002 s
+- raw Qwen choices: 3
+- validated Qwen: 3
+- controller-added: 1
+- final pool: 4
+- goal_id: explore_frontier
+
+Call 2:
+- client latency: 11.000 s
+- Ollama load_duration: 0.004 s
+- raw Qwen choices: 3
+- validated Qwen: 3
+- controller-added: 1
+- final pool: 4
+- goal_id: explore_frontier
+
+Earlier audit:
+- total_duration ~33.665 s
+- load_duration ~18.27 s
+- prompt_eval_duration ~9.23 s
+- eval_duration ~6.15 s
+Internal Ollama timing matched client latency and proved the local model call was genuine.
+
+TELEMETRY CORRECTION
+Older latency_seconds was misleading because timing began after Qwen returned. It measured bridge/game round trip only.
+Current telemetry separates:
+- model_latency_seconds
+- bridge_latency_seconds
+
+FAILED RUN BEFORE CURRENT FIXES
+One 5-minute run:
+- first 4 fast_frontier moves blocked
+- then 53 consecutive wait_one_turn
+- repeated goal claimed "recover stamina"
+- actual stamina 8600/8600 throughout
+Root causes:
+- false homeostatic goal availability
+- stale/no-progress behavior
+Fixes:
+- real stamina gate
+- no-progress counters/stale-goal breaker
+- eight-way movement
+- explicit stall handling
+
+LATEST RUN BEFORE CURRENT FIXES: 20260919-170636
+Action pattern:
+1 open_adjacent opened
+2-7 movement
+8 eat_best_food -> consume_activity_started
+9 eat_best_food -> consume_activity_started
+10-21 movement
+
+Eating completion evidence:
+- verified=false
+- hunger_delta=1, threshold=5
+- kcal_delta=0, threshold=10
+- before_kcal=108949
+- after_kcal=108949
+- hunger around 1
+Interpretation:
+Verifier was honest, but eat should not have been available because there was no meaningful hunger need.
+
+Movement behavior:
+- 7 distinct tiles initially
+- later roughly four-tile bouncing cluster
+- active goal alternated between apple/resource approach and generic safe progress
+- some model reasons cited laptop computer / battery charger although current allowed actions could not interact with them
+
+Approximate selected provenance:
+- 16 qwen
+- 5 controller_generated
+
+CURRENT FIXES APPLIED AFTER 170636
+Python:
+- centralized homeostatic action gates
+- remembered ground consumables
+- code-enforced goal commitment
+- goal/action compatibility
+- controller-added candidates filtered by the same compatibility
+- stronger replanning evidence
+- non-actionable-object reasoning restricted
+
+C++:
+- bridge does not solicit another Nova command while a native CDDA activity is active
+
+VALIDATION STATE
+No clean pass yet for pickup/eat/drink.
+Required next clean evidence:
+1. real food/water exists,
+2. hunger/thirst genuinely crosses action gate,
+3. one consume activity completes,
+4. post-activity physiology verifies,
+5. no duplicate dispatch,
+6. no goal thrash/loop.
