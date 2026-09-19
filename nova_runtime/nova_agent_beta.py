@@ -54,6 +54,12 @@ MIN_HUNGER_IMPROVEMENT = 5
 MIN_THIRST_IMPROVEMENT = 5
 MIN_STORED_KCAL_IMPROVEMENT = 10
 
+# Validation gating: do not expose a homeostatic action when the measured
+# need is already satisfied.  These are intentionally conservative until
+# real CDDA before/after evidence justifies richer appetite logic.
+EAT_NEED_HUNGER = 20
+DRINK_NEED_THIRST = 20
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -231,6 +237,10 @@ class WorldModel:
                     "passable": bool(t.get("passable")),
                     "openable": bool(t.get("openable")),
                     "items": list(t.get("items") or []),
+                    "ground_consumables": [
+                        dict(x) for x in (t.get("ground_consumables") or [])
+                        if isinstance(x, dict)
+                    ],
                 }
             except Exception:
                 pass
@@ -425,26 +435,73 @@ def resource_need_weight(state: dict, resource: dict) -> float:
         weight += min(0.25, hunger / 300.0)
     return weight
 
+def need_profile(state: dict) -> dict:
+    hunger = int(state.get("hunger", 0) or 0)
+    thirst = int(state.get("thirst", 0) or 0)
+    stamina = int(state.get("stamina", 0) or 0)
+    stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+    return {
+        "hunger": hunger,
+        "thirst": thirst,
+        "stamina_ratio": stamina / stamina_max,
+        "eat_needed": hunger >= EAT_NEED_HUNGER,
+        "drink_needed": thirst >= DRINK_NEED_THIRST,
+    }
+
+def known_storable_consumables(state: dict, wm: WorldModel | None) -> list[dict]:
+    if wm is None:
+        return visible_storable_consumables(state)
+    px, py, pz = pos_tuple(state)
+    found = []
+    for (gx, gy, gz), tile in wm.known_tiles.items():
+        if gz != pz:
+            continue
+        dx = gx - px
+        dy = gy - py
+        # Keep this a local executive target, not a global path planner yet.
+        if abs(dx) > 16 or abs(dy) > 16:
+            continue
+        for food in (tile.get("ground_consumables") or []):
+            if not isinstance(food, dict) or not bool(food.get("storable_without_wield", False)):
+                continue
+            name = str(food.get("name", "")).strip()
+            if not name:
+                continue
+            found.append({
+                "dx": dx,
+                "dy": dy,
+                "gx": gx,
+                "gy": gy,
+                "gz": gz,
+                "name": name,
+                "nutrition": int(food.get("nutrition", 0) or 0),
+                "quench": int(food.get("quench", 0) or 0),
+                "distance": abs(dx) + abs(dy),
+            })
+    return found
+
 def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = None) -> list[dict]:
     candidates = []
     action_names = {a.get("action") for a in actions}
 
-    if "drink_best" in action_names and int(state.get("thirst", 0) or 0) > 20:
+    needs = need_profile(state)
+
+    if "drink_best" in action_names and needs["drink_needed"]:
         candidates.append({
             "goal_id": "reduce_thirst",
             "intention": "drink something safe to reduce thirst",
             "supported_by": ["drink_best"],
             "priority": 0.98,
         })
-    if "eat_best_food" in action_names and int(state.get("hunger", 0) or 0) > 20:
+    if "eat_best_food" in action_names and needs["eat_needed"]:
         candidates.append({
             "goal_id": "reduce_hunger",
             "intention": "eat something safe to reduce hunger",
             "supported_by": ["eat_best_food"],
             "priority": 0.96,
         })
-    visible_resources = visible_storable_consumables(state)
-    nonadjacent_resources = [r for r in visible_resources if int(r.get("distance", 99)) > 1]
+    known_resources = known_storable_consumables(state, wm)
+    nonadjacent_resources = [r for r in known_resources if int(r.get("distance", 99)) > 1]
     if nonadjacent_resources and "move_one_tile" in action_names:
         target = max(
             nonadjacent_resources,
@@ -480,9 +537,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["move_one_tile", "open_adjacent"],
             "priority": 0.72,
         })
-    stamina = int(state.get("stamina", 0) or 0)
-    stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
-    stamina_ratio = stamina / stamina_max
+    stamina_ratio = float(needs["stamina_ratio"])
     wait_actions = [a for a in actions if a.get("action") == "wait_one_turn"]
     if wait_actions and stamina_ratio < 0.70:
         candidates.append({
@@ -531,6 +586,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     hostiles = hostile_positions(state)
     loop = wm.looping()
     visible_resources = visible_storable_consumables(state)
+    known_resources = known_storable_consumables(state, wm)
 
     for name, (dx, dy) in CARDINALS.items():
         t = tiles.get((dx, dy))
@@ -571,10 +627,10 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             score = 0.58 + 0.30 * novelty
             resource_distance_delta = 0
             nearest_resource = None
-            if visible_resources:
-                nearest_resource = min(
-                    visible_resources,
-                    key=lambda r: abs(int(r["dx"])) + abs(int(r["dy"]))
+            if known_resources:
+                nearest_resource = max(
+                    known_resources,
+                    key=lambda r: resource_need_weight(state, r) - 0.03 * float(r.get("distance", 0))
                 )
                 before_distance = abs(int(nearest_resource["dx"])) + abs(int(nearest_resource["dy"]))
                 after_distance = (
@@ -641,19 +697,22 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             })
 
     consumables = state.get("inventory_consumables", [])
-    hunger = int(state.get("hunger", 0) or 0)
-    thirst = int(state.get("thirst", 0) or 0)
-    if any(int(x.get("nutrition", 0) or 0) > 0 for x in consumables):
+    needs = need_profile(state)
+    hunger = int(needs["hunger"])
+    thirst = int(needs["thirst"])
+    if needs["eat_needed"] and any(int(x.get("nutrition", 0) or 0) > 0 for x in consumables):
         actions.append({
             "action": "eat_best_food",
-            "label": "eat the best safe carried food",
-            "controller_score": min(0.90, 0.30 + max(0, hunger) / 180.0),
+            "label": "eat the best safe carried food because hunger is meaningful",
+            "controller_score": min(0.90, 0.45 + max(0, hunger - EAT_NEED_HUNGER) / 180.0),
+            "need_evidence": {"hunger": hunger, "threshold": EAT_NEED_HUNGER},
         })
-    if any(int(x.get("quench", 0) or 0) > 0 for x in consumables):
+    if needs["drink_needed"] and any(int(x.get("quench", 0) or 0) > 0 for x in consumables):
         actions.append({
             "action": "drink_best",
-            "label": "drink the best safe carried drink",
-            "controller_score": min(0.90, 0.30 + max(0, thirst) / 160.0),
+            "label": "drink the best safe carried drink because thirst is meaningful",
+            "controller_score": min(0.90, 0.45 + max(0, thirst - DRINK_NEED_THIRST) / 160.0),
+            "need_evidence": {"thirst": thirst, "threshold": DRINK_NEED_THIRST},
         })
 
     stamina = int(state.get("stamina", 0) or 0)
@@ -784,6 +843,37 @@ def normalize_choice(raw: dict, allowed: list[dict]):
         return out
     return None
 
+def candidate_serves_goal(candidate: dict, goal: dict) -> bool:
+    action = candidate.get("action")
+    goal_id = goal.get("goal_id")
+    supported = set(goal.get("supported_by") or [])
+    if action not in supported:
+        return False
+
+    if goal_id == "approach_consumable":
+        if action == "pickup_consumable":
+            return True
+        if action == "move_one_tile":
+            return int(candidate.get("resource_distance_delta", 0) or 0) > 0
+        return False
+    if goal_id == "acquire_consumable":
+        return action == "pickup_consumable"
+    if goal_id == "reduce_hunger":
+        return action == "eat_best_food"
+    if goal_id == "reduce_thirst":
+        return action == "drink_best"
+    if goal_id == "recover_stamina":
+        return action == "wait_one_turn" and candidate.get("wait_reason") == "recover_stamina"
+    if goal_id == "reassess_stall":
+        return action == "wait_one_turn" and candidate.get("wait_reason") == "stalled"
+    if goal_id == "open_boundary":
+        return action == "open_adjacent"
+    if goal_id == "explore_frontier":
+        if action == "open_adjacent":
+            return True
+        return action == "move_one_tile" and int(candidate.get("visits_target", 0) or 0) == 0
+    return True
+
 def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict],
                     replan: bool, trace_path: Path) -> tuple[list[dict], str, str, float, dict, int]:
     world = compact_world(state, wm, actions)
@@ -800,6 +890,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         "is approach_consumable. "
         "An active intention must be achievable with allowed_actions now. "
         "Never invent an action that is not in allowed_actions. "
+        "Do not cite laptops, chargers, tools, furniture, or other non-actionable objects as reasons unless an allowed action can actually interact with them. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
     )
     if replan:
@@ -835,9 +926,21 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     candidates = goal_candidates(state, actions, wm)
     by_id = {g["goal_id"]: g for g in candidates}
     proposed_goal_id = str(parsed.get("goal_id", "")).strip()
-    chosen_goal = by_id.get(proposed_goal_id)
-    if chosen_goal is None:
-        chosen_goal = choose_fallback_goal(candidates)
+    if not replan and wm.active_goal_id in by_id:
+        chosen_goal = by_id[wm.active_goal_id]
+    else:
+        chosen_goal = by_id.get(proposed_goal_id)
+        if chosen_goal is None:
+            chosen_goal = choose_fallback_goal(candidates)
+
+    compatible = [a for a in actions if candidate_serves_goal(a, chosen_goal)]
+    if not compatible:
+        viable_goals = [
+            g for g in candidates
+            if any(candidate_serves_goal(a, g) for a in actions)
+        ]
+        chosen_goal = choose_fallback_goal(viable_goals or candidates)
+
     intention = str(chosen_goal["intention"])
     goal_id = str(chosen_goal["goal_id"])
     choices = []
@@ -845,7 +948,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     for raw in parsed.get("choices", [])[:3]:
         if isinstance(raw, dict):
             valid = normalize_choice(raw, actions)
-            if valid:
+            if valid and candidate_serves_goal(valid, chosen_goal):
                 # Hybrid executive score: Qwen judgment + grounded progress utility.
                 qs = float(valid.get("qwen_score", 0.5))
                 cs = float(valid.get("controller_score", 0.5))
@@ -873,6 +976,8 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     # Do not let Qwen accidentally hide a highly meaningful grounded option.
     # Unmentioned legal actions remain candidates with a modest model prior.
     for candidate in actions:
+        if not candidate_serves_goal(candidate, chosen_goal):
+            continue
         key = (candidate.get("action"), candidate.get("dx"), candidate.get("dy"), candidate.get("item_name"))
         if key in represented:
             continue
@@ -922,11 +1027,18 @@ def fallback_choice(state: dict, wm: WorldModel, actions: list[dict]):
 def should_replan(wm: WorldModel, situation: dict, state: dict, actions: list[dict]) -> bool:
     if not wm.active_intention or not wm.active_goal_id:
         return True
-    if not goal_still_supported(wm, actions, state):
+    candidates = goal_candidates(state, actions, wm)
+    by_id = {g["goal_id"]: g for g in candidates}
+    active = by_id.get(wm.active_goal_id)
+    if active is None or not goal_still_supported(wm, actions, state):
         return True
     if wm.goal_no_progress.get(wm.active_goal_id, 0) >= 4:
         return True
-    if wm.intention_age >= 6:
+    best_priority = max(float(g.get("priority", 0.0)) for g in candidates)
+    active_priority = float(active.get("priority", 0.0))
+    if best_priority >= active_priority + 0.08:
+        return True
+    if wm.intention_age >= 12:
         return True
     if situation.get("loop_detected"):
         return True
