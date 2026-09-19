@@ -1,0 +1,150 @@
+NOVA / CDDA — DEEPSEEK HANDOFF
+Generated: 2026-09-19
+Repository: novanlnx/Cataclysm-DDA
+Working branch: nova-survival-core-validation
+
+CURRENT BRANCH HEAD INCLUDES
+- 365e1e4d555cfcdc7913728783ba221625f7f498 — Gate needs and enforce goal-consistent committed choices
+- 2313caf4a5bcbe0a42116b1208c75d217ef933ec — Let native activities finish before Nova can dispatch again
+
+PURPOSE
+Nova is a local autonomous AI-agent runtime intended to inhabit a real game as a persistent character: perceive, remember, reflect, plan, and act. Current game body is Cataclysm: Dark Days Ahead (CDDA), official CleverRaven experimental Windows tiles/source based on cdda-experimental-2026-09-18-0640, original base commit 63a3cd00aadf2df23976544ae9983d062432fed8.
+
+Local deliberative model: Ollama qwen2.5:7b.
+
+CORE DESIGN INVARIANTS
+1. Thought is permissive, action is strict. Nova may think/want anything, but only verified capabilities may affect the game.
+2. Never fake game effects by mutating external state when a native CDDA action exists.
+3. Evidence outranks model narration. Sensor/state facts constrain goals. Native before/after evidence verifies outcomes.
+4. Deterministic where nothing is at stake; use Qwen when judgment is actually needed.
+5. Small, testable validation deltas. Current ladder: supervised 5 min -> inspect -> 10 min -> inspect -> 30 min. Do not skip rungs.
+6. The long-term target is not a scripted bot. It is a coherent persistent artificial character with needs, memory, identity, curiosity, comfort/coziness, survival judgment, reflection, planning, and controlled variation.
+7. In-game thought UI shows exactly the last 3 short user-facing entries, newest at bottom. These are concise situation/intention/action/outcome summaries, not hidden chain-of-thought.
+
+CURRENT ARCHITECTURE
+A) Native C++ bridge in src/do_turn.cpp
+- Enabled only when NOVA_BRIDGE_DIR is set.
+- File IPC: command.json plus immutable response-<id>.json.
+- Movement calls real avatar_action::move.
+- Door open calls native CDDA map.open_door.
+- Eat/drink call avatar_action::eat.
+- Pickup obtains a real item_location, with a validation safety gate preventing fallback-to-wield/disposal-menu behavior.
+- Snapshot telemetry includes absolute coordinates, moves, hunger, thirst, sleepiness, stamina/max, stored/healthy kcal, pain, morale, activity id, indoors, local 5x5 terrain/passability/door metadata/items, nearby creatures, inventory consumables.
+- Nova panel in src/panels.cpp reads NOVA_BRIDGE_DIR/nova-thoughts.txt.
+
+B) Python controller nova_runtime/nova_agent_beta.py
+- Maintains local world model, visits, known tiles, remembered blocked edges, recent positions/actions, active goal/intention, no-progress counters.
+- Qwen calls real local Ollama /api/chat.
+- Qwen request uses keep_alive="30m".
+- Raw model requests/responses and Ollama timing metrics are written to nova-model-trace-*.jsonl.
+- Empty frontier exploration has a deterministic fast path.
+- Important/relevant scenes call Qwen.
+- Final dispatch allowlist on this validation branch:
+  observe, move_one_tile, open_adjacent, wait_one_turn, pickup_consumable, eat_best_food, drink_best.
+- No sleep/equip/combat is allowed by the current validation controller.
+
+MODEL AUDIT — VERIFIED
+The local Qwen call is real, not a stub/fallback.
+Two-call audit:
+CALL 1: latency 29.250s; Ollama load 18.002s.
+CALL 2: latency 11.000s; Ollama load 0.004s.
+Both request bodies included keep_alive="30m".
+Raw Qwen choices = 3; validated Qwen choices = 3; controller-added grounded candidate = 1; final candidate pool = 4.
+This proved warm reuse and also exposed the need for provenance labeling.
+
+CURRENT PROVENANCE LABELS
+- qwen
+- controller_generated
+- controller_fast_path
+- safety
+- fallback
+The controller now records model latency separately from bridge/action latency.
+
+WHAT HAS BEEN PROVEN
+- Native movement can move the real avatar and spend moves/stamina.
+- Door opening works natively.
+- Absolute world coordinates fixed the old reality-bubble recenter corruption.
+- Windows thought-feed file locking no longer kills the controller.
+- The 3-line Nova UI redraws while the bridge waits.
+- Qwen/Ollama calls are real and warm-model keep_alive works.
+- Native blocked movement becomes evidence and blocked source->target edges are remembered.
+- Eight adjacent movement directions are now considered by the controller.
+- Unsafe pickup no longer deliberately falls back to wielding if storage is unavailable.
+- Controller has a hard validation dispatch gate.
+- False "recover stamina" goal was fixed: recover_stamina is not a candidate unless stamina is genuinely low.
+- A no-progress/stale-goal breaker now exists.
+
+MOST IMPORTANT RECENT RUN — 20260919-170636
+Observed actions:
+1 open_adjacent opened
+2-7 movement
+8 eat_best_food -> consume_activity_started
+9 eat_best_food -> consume_activity_started
+10-21 movement
+
+Key findings:
+1. Character genuinely moved and explored. This was real progress over the prior frozen run.
+2. The apple was real. The agent genuinely attempted eat_best_food.
+3. Eating verification correctly failed:
+   - verified=false
+   - hunger_delta=1, minimum required=5
+   - kcal_delta=0, minimum required=10
+   - before_kcal=108949, after_kcal=108949
+4. Character was effectively not hungry: hunger around 1. Therefore eat_best_food should never have been available as a homeostatic action.
+5. Eat was dispatched twice back-to-back while CDDA represented eating as consume_activity_started. This revealed missing activity exclusivity.
+6. Later motion bounced among a small four-tile region while the stated goal changed between apple/resource approach and generic safe progress. Qwen explanations also cited non-actionable objects such as laptop computer and battery charger.
+7. Provenance in this run was approximately 16 Qwen-selected and 5 controller-generated selected decisions. Controller-generated candidates were therefore influencing a material share of outcomes.
+
+FIXES ALREADY APPLIED AFTER THAT RUN
+CONTROLLER COMMIT 365e1e4:
+- Added central need_profile().
+- eat_best_food is NOT exposed unless hunger >= 20.
+- drink_best is NOT exposed unless thirst >= 20.
+- stamina recovery remains sensor-gated.
+- World model now remembers ground consumables on known tiles instead of forgetting them immediately when they leave the 5x5 window.
+- Known storable consumables within a limited local radius can remain executive targets.
+- Qwen's active goal is now actually preserved in code when not replanning; this is no longer just a prompt instruction.
+- candidate_serves_goal() now rejects actions that do not serve the chosen goal.
+- Controller-generated candidates are also filtered through goal compatibility.
+- For approach_consumable, only pickup or movement that actually reduces resource distance is compatible.
+- Prompt explicitly says not to cite laptops/chargers/tools/furniture as reasons unless an allowed action can act on them.
+- Replanning now requires evidence: unsupported goal, no progress, a sufficiently higher-priority goal, loop, or longer checkpoint.
+
+C++ COMMIT 2313caf:
+- The native turn integration no longer asks the Nova bridge for a new command while u.activity is active.
+- Rationale: once CDDA starts a native multi-turn activity such as eating, CDDA owns it until completion/interruption.
+- This prevents a second eat command from being accepted before the first consume activity has resolved.
+- Because this is C++, a new Windows EXE build is required before the next gameplay validation.
+
+CURRENT TEST STATUS
+The current pickup/eat/drink validation sub-batch is NOT passed yet.
+Pickup/eat/drink require real before/after evidence.
+Eating has been attempted but has not yet produced a verified physiological result because it was attempted while not meaningfully hungry.
+Drink remains unverified.
+Do not advance to 10 minutes until the 5-minute rung produces clean evidence.
+
+IMPORTANT IMPLEMENTATION PHILOSOPHY
+Please do not recommend simply adding more free-form prompt text to fix executive failures. Prefer architectural constraints that preserve model agency while preventing factual contradictions:
+sensor facts -> affordances -> goal candidates -> model judgment -> action arbiter -> native action -> verified outcome -> memory/replan.
+
+LONG-TERM COGNITION TARGET
+The intended direction is inspired by Stanford/Google Generative Agents but improved:
+- structured MemoryNodes/event stream
+- correct recency/relevance/importance retrieval
+- deterministic salience
+- evidence-linked reflection
+- tiered persistent identity
+- short-horizon plans
+- controlled variation
+- strict action arbiter
+- stale belief/goal correction against observed evidence
+- fast deterministic execution for obvious micro-actions, Qwen for meaningful judgment
+
+FILES TO READ WITH THIS HANDOFF
+01_READ_FIRST_NOVA_DEEPSEEK_HANDOFF.txt
+02_DEEPSEEK_DECISION_QUESTIONS.txt
+03_CURRENT_NOVA_CONTROLLER.py.txt
+04_NOVA_BRIDGE_RELEVANT_CPP.txt
+05_RECENT_TEST_AND_MODEL_EVIDENCE.txt
+
+Please treat code/state evidence as authoritative over prose descriptions if they conflict.
