@@ -558,6 +558,38 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 
     return actions
 
+def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> bool:
+    # Qwen is for judgment, not footsteps.  Empty frontier walking should be
+    # immediate; deliberate when something actionable or risky appears.
+    if wm.looping():
+        return True
+    if any(str(c.get("attitude", "")).lower() == "hostile"
+           for c in state.get("nearby_creatures", [])):
+        return True
+    if any(t.get("openable") for t in state.get("local_tiles", [])):
+        return True
+    if any(a.get("action") in {"pickup_consumable", "eat_best_food", "drink_best"}
+           for a in actions):
+        return True
+    if visible_storable_consumables(state):
+        return True
+    return False
+
+def fast_frontier_choice(state: dict, wm: WorldModel, actions: list[dict]):
+    candidates = [
+        a for a in actions
+        if a.get("action") == "move_one_tile"
+        and not a.get("hostile_on_tile")
+        and int(a.get("visits_target", 0) or 0) == 0
+    ]
+    if not candidates:
+        return None
+    choice = max(candidates, key=lambda a: float(a.get("controller_score", 0.0)))
+    out = dict(choice)
+    out["decision_mode"] = "fast_frontier"
+    out["reason"] = "deterministic frontier step; nothing currently requires deliberation"
+    return out
+
 def deterministic_safety(state: dict, actions: list[dict]):
     def find(name: str):
         return next((a for a in actions if a.get("action") == name), None)
@@ -821,12 +853,14 @@ def main() -> int:
         actions = available_actions(state, wm)
         safety = deterministic_safety(state, actions)
         model_error = None
+        decision_mode = None
         replan = should_replan(wm, sit, state, actions)
 
         feed.push("SEE: " + describe_situation(sit))
 
         if safety:
             choice, reason = safety
+            decision_mode = "safety"
             intention = wm.active_intention or "stay alive and stabilize immediate needs"
             feed.push("INTENT: " + intention)
         else:
@@ -834,7 +868,16 @@ def main() -> int:
             reason = ""
             intention = wm.active_intention
 
-            if model:
+            if not needs_qwen_judgment(state, wm, actions):
+                choice = fast_frontier_choice(state, wm, actions)
+                if choice:
+                    decision_mode = "fast_frontier"
+                    wm.active_goal_id = "explore_frontier"
+                    wm.active_intention = "explore nearby unvisited space and update the local map"
+                    intention = wm.active_intention
+                    reason = choice.get("reason", "")
+
+            if choice is None and model:
                 try:
                     options, proposed_goal_id, proposed_intention = qwen_deliberate(
                         model, state, wm, actions, replan
@@ -849,12 +892,14 @@ def main() -> int:
                     intention = wm.active_intention
                     choice = choose_with_variation(options)
                     if choice:
+                        decision_mode = "qwen"
                         reason = choice.get("reason") or "Qwen selected this as progress toward the intention"
                 except Exception as exc:
                     model_error = repr(exc)
 
             if not choice:
                 choice, reason = fallback_choice(state, wm, actions)
+                decision_mode = "fallback"
                 if not wm.active_intention:
                     fallback_goal = choose_fallback_goal(goal_candidates(state, actions))
                     wm.active_goal_id = fallback_goal["goal_id"]
@@ -901,6 +946,7 @@ def main() -> int:
             "wall_time": utc_now(),
             "action_index": action_count,
             "model": model,
+            "decision_mode": decision_mode,
             "situation": sit,
             "active_goal_id": wm.active_goal_id,
             "active_intention": wm.active_intention,
@@ -925,7 +971,7 @@ def main() -> int:
             print(f"[{action_count}] {action}: COMMAND ERROR {command_error}")
             break
 
-        print(f"[{action_count}] {action}: {outcome} | goal={wm.active_intention!r} | {reason[:90]}")
+        print(f"[{action_count}] {action}: {outcome} | mode={decision_mode} | goal={wm.active_intention!r} | {reason[:90]}")
         wm.record_action(state, choice, outcome)
 
         previous_state = state
