@@ -122,7 +122,7 @@ namespace nova_bridge
 
 namespace fs = std::filesystem;
 
-static constexpr const char *protocol_version = "nova-cdda-bridge-v3-cognition-beta";
+static constexpr const char *protocol_version = "nova-cdda-bridge-v4-evolution";
 
 struct ground_consumable_snapshot {
     std::string name;
@@ -172,6 +172,7 @@ struct state_snapshot {
     int pain = 0;
     int morale = 0;
     bool indoors = false;
+    bool dead = false;
     std::string activity;
     std::vector<local_tile_snapshot> local_tiles;
     std::vector<creature_snapshot> creatures;
@@ -215,6 +216,7 @@ static state_snapshot snapshot( avatar &u )
     state.pain = u.get_pain();
     state.morale = u.get_morale_level();
     state.indoors = !m.is_outside( pos );
+    state.dead = u.is_dead_state();
     state.activity = u.activity ? u.activity.id().str() : std::string();
 
     const bool inside = !m.is_outside( pos );
@@ -314,6 +316,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.member( "pain", state.pain );
     jsout.member( "morale", state.morale );
     jsout.member( "indoors", state.indoors );
+    jsout.member( "dead", state.dead );
     jsout.member( "activity", state.activity );
 
     jsout.member( "local_tiles" );
@@ -373,6 +376,45 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.end_array();
 
     jsout.end_object();
+}
+
+static void write_life_status( avatar &u )
+{
+    const std::optional<fs::path> maybe_dir = bridge_dir();
+    if( !maybe_dir ) {
+        return;
+    }
+
+    const fs::path dir = *maybe_dir;
+    std::error_code ec;
+    fs::create_directories( dir, ec );
+    if( ec ) {
+        return;
+    }
+
+    const state_snapshot state = snapshot( u );
+    const fs::path status = dir / "life-status.json";
+    const fs::path status_tmp = dir / "life-status.json.tmp";
+    {
+        std::ofstream fout( status_tmp, std::ios::trunc );
+        JsonOut jsout( fout, true );
+        jsout.start_object();
+        jsout.member( "protocol", protocol_version );
+        jsout.member( "dead", state.dead );
+        jsout.member( "turn", state.turn );
+        jsout.member( "position" );
+        jsout.start_object();
+        jsout.member( "x", state.x );
+        jsout.member( "y", state.y );
+        jsout.member( "z", state.z );
+        jsout.end_object();
+        jsout.member( "activity", state.activity );
+        jsout.end_object();
+    }
+    fs::rename( status_tmp, status, ec );
+    if( ec ) {
+        DebugLog( D_ERROR, D_GAME ) << "Nova bridge could not publish life status: " << ec.message();
+    }
 }
 
 static void write_response( const fs::path &dir, const std::string &command_id,
@@ -445,6 +487,7 @@ static item_location best_consumable( avatar &u, bool drink )
 
 static bool wait_for_turn_action( avatar &u, map &m )
 {
+    write_life_status( u );
     const std::optional<fs::path> maybe_dir = bridge_dir();
     if( !maybe_dir ) {
         return false;
@@ -1071,6 +1114,9 @@ void game::handle_progress_ui()
 bool game::do_turn()
 {
     if( is_game_over() ) {
+        if( nova_bridge::bridge_dir() ) {
+            nova_bridge::write_life_status( get_avatar() );
+        }
         return turn_handler::cleanup_at_end();
     }
 
@@ -1224,6 +1270,9 @@ bool game::do_turn()
                 }
 
                 if( is_game_over() ) {
+                    if( nova_bridge::bridge_dir() ) {
+                        nova_bridge::write_life_status( u );
+                    }
                     return turn_handler::cleanup_at_end();
                 }
 
