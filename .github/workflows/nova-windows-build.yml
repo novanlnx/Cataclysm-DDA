@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - nova-survival-core-validation
+      - nova-evolution-v1
 
 jobs:
   build:
