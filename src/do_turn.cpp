@@ -123,6 +123,7 @@ namespace nova_bridge
 namespace fs = std::filesystem;
 
 static constexpr const char *protocol_version = "nova-cdda-bridge-v4-evolution";
+static constexpr int life_status_schema_version = 1;
 
 struct ground_consumable_snapshot {
     std::string name;
@@ -399,7 +400,9 @@ static void write_life_status( avatar &u )
         std::ofstream fout( status_tmp, std::ios::trunc );
         JsonOut jsout( fout, true );
         jsout.start_object();
+        jsout.member( "schema_version", life_status_schema_version );
         jsout.member( "protocol", protocol_version );
+        jsout.member( "status", state.dead ? "dead" : "alive" );
         jsout.member( "dead", state.dead );
         jsout.member( "turn", state.turn );
         jsout.member( "position" );
@@ -411,6 +414,9 @@ static void write_life_status( avatar &u )
         jsout.member( "activity", state.activity );
         jsout.end_object();
     }
+    ec.clear();
+    fs::remove( status, ec );
+    ec.clear();
     fs::rename( status_tmp, status, ec );
     if( ec ) {
         DebugLog( D_ERROR, D_GAME ) << "Nova bridge could not publish life status: " << ec.message();
