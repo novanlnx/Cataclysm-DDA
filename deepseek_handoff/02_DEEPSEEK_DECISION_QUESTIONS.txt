@@ -1,0 +1,66 @@
+NOVA — DECISIONS REQUESTED FROM DEEPSEEK
+
+Please review all accompanying files and give architectural criticism, not generic encouragement.
+
+1. EXECUTIVE LAYER
+Given a 7B local Qwen model, is this hierarchy sensible?
+sensor facts -> deterministic affordances/need gates -> finite goal candidates -> Qwen judgment -> goal/action compatibility gate -> native action -> verification -> memory/replan.
+What would you change first?
+
+2. NEEDS / HOMEOSTASIS
+Current validation gates:
+- eat available at hunger >= 20
+- drink available at thirst >= 20
+- recover stamina only when stamina ratio < 0.70
+Should these remain hard action-availability gates, or should there be a graded drive model plus hard sanity limits?
+Recommend a concrete design that prevents "eat while full" and "rest at 100% stamina" without making Nova robotic.
+
+3. GOAL PERSISTENCE
+Current controller preserves active goal unless:
+- goal becomes unsupported
+- same goal has >=4 no-progress actions
+- new goal exceeds active priority by >=0.08
+- intention age reaches 12 actions
+- loop detector fires
+Is this a reasonable first policy? Suggest a better evidence-based commitment/interruption/abandonment policy.
+
+4. CONTROLLER-GENERATED CANDIDATES
+Qwen proposes up to 3 choices. The executive validates them, then may add legal controller-generated candidates that Qwen omitted. Final hybrid chooser can select either.
+Should controller-generated candidates participate in the same pool, or should controller act only as veto/repair/fallback after Qwen chooses?
+How would you preserve Qwen's judgment while preventing obvious omissions?
+
+5. NAVIGATION / RESOURCE TARGETING
+Nova remembers known consumables and scores moves by distance reduction, but has no real path planner.
+Should we add deterministic A*/BFS pathfinding to a committed target and let Qwen choose destinations rather than individual steps?
+If yes, propose the clean division between Qwen and navigator.
+
+6. ACTIVITY LIFECYCLE
+CDDA eating returns consume_activity_started. C++ now prevents Nova from dispatching another command while u.activity exists.
+Would you additionally defer the consume command response until the activity finishes, or is it cleaner to return activity_started and only allow the next observe after native activity completion?
+Discuss timeouts/interruption/error cases.
+
+7. VERIFICATION
+Current eat verification requires either hunger improvement >=5 or stored kcal increase >=10. Drink requires thirst decrease >=5.
+Are these appropriate validation signals for CDDA? Which additional fields/events should be exposed before declaring eat/drink reliable?
+
+8. MEMORY / REFLECTION
+Recommend the minimum viable next cognition layer after the current survival sub-batch passes:
+- event memory schema
+- retrieval scoring
+- reflection trigger/cadence
+- persistent identity/preferences
+- short-horizon planning
+Avoid a huge framework; propose the smallest useful version that can be validated empirically.
+
+9. MODEL CALL FREQUENCY
+Warm Qwen calls take about 11 seconds. Empty movement is deterministic.
+Which events should force Qwen deliberation, and which should be handled without Qwen?
+
+10. TEST STRATEGY
+Current ladder: 5 min -> inspect -> 10 min -> inspect -> 30 min.
+What exact pass/fail evidence would you require before moving to 10 minutes for pickup/eat/drink?
+
+Please finish with:
+A. Top 5 changes, ordered by dependency.
+B. Which require C++ rebuild vs Python-only.
+C. One concrete 5-minute test scenario that gives maximum evidence for minimum time.
