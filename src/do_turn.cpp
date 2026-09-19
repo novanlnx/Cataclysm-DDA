@@ -139,6 +139,7 @@ struct local_tile_snapshot {
     bool passable = false;
     bool openable = false;
     bool closable = false;
+    bool indoors = false;
     std::vector<std::string> items;
     std::vector<ground_consumable_snapshot> consumables;
 };
@@ -173,6 +174,7 @@ struct state_snapshot {
     int pain = 0;
     int morale = 0;
     bool indoors = false;
+    bool is_night_time = false;
     bool dead = false;
     std::string activity;
     std::vector<local_tile_snapshot> local_tiles;
@@ -217,6 +219,7 @@ static state_snapshot snapshot( avatar &u )
     state.pain = u.get_pain();
     state.morale = u.get_morale_level();
     state.indoors = !m.is_outside( pos );
+    state.is_night_time = is_night( calendar::turn );
     state.dead = u.is_dead_state();
     state.activity = u.activity ? u.activity.id().str() : std::string();
 
@@ -234,6 +237,7 @@ static state_snapshot snapshot( avatar &u )
             tile.passable = m.passable( p );
             tile.openable = m.open_door( u, p, inside, true );
             tile.closable = m.close_door( p, inside, true );
+            tile.indoors = !m.is_outside( p );
             int item_count = 0;
             for( const item &it : m.i_at( p ) ) {
                 if( item_count >= 3 ) {
@@ -317,6 +321,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.member( "pain", state.pain );
     jsout.member( "morale", state.morale );
     jsout.member( "indoors", state.indoors );
+    jsout.member( "is_night", state.is_night_time );
     jsout.member( "dead", state.dead );
     jsout.member( "activity", state.activity );
 
@@ -330,6 +335,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
         jsout.member( "passable", tile.passable );
         jsout.member( "openable", tile.openable );
         jsout.member( "closable", tile.closable );
+        jsout.member( "indoors", tile.indoors );
         jsout.member( "items" );
         jsout.start_array();
         for( const std::string &name : tile.items ) {
