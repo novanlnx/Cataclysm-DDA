@@ -19,6 +19,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate Nova controller syntax
+        shell: pwsh
+        run: python -m py_compile nova_runtime\nova_agent_beta.py
+
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
 
