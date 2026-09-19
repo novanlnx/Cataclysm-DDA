@@ -18,6 +18,7 @@ STATE_DIR = ROOT / "nova-state"
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 RUN_MINUTES = int(os.environ.get("NOVA_RUN_MINUTES", "60"))
 MODEL_OVERRIDE = os.environ.get("NOVA_MODEL", "").strip()
+MODEL_AUDIT = os.environ.get("NOVA_MODEL_AUDIT", "").strip().lower() in {"1", "true", "yes", "on"}
 
 CARDINALS = {
     "north": (0, -1),
@@ -100,6 +101,45 @@ def ollama_json(path: str, payload: dict | None = None, timeout: float = 180.0) 
         req = request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     with request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+def ollama_chat_traced(payload: dict, trace_path: Path, timeout: float = 180.0) -> tuple[dict, float]:
+    url = OLLAMA + "/api/chat"
+    request_body = json.dumps(payload, ensure_ascii=False)
+    req = request.Request(
+        url,
+        data=request_body.encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.monotonic()
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            response_body = resp.read().decode("utf-8")
+            elapsed = time.monotonic() - started
+            status = getattr(resp, "status", None)
+            append_log(trace_path, {
+                "wall_time": utc_now(),
+                "endpoint": url,
+                "http_method": "POST",
+                "request_body": request_body,
+                "response_status": status,
+                "response_body": response_body,
+                "model_latency_seconds": round(elapsed, 3),
+            })
+            return json.loads(response_body), elapsed
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        append_log(trace_path, {
+            "wall_time": utc_now(),
+            "endpoint": url,
+            "http_method": "POST",
+            "request_body": request_body,
+            "response_status": None,
+            "response_body": None,
+            "model_latency_seconds": round(elapsed, 3),
+            "error": repr(exc),
+        })
+        raise
 
 def pick_model() -> str | None:
     if MODEL_OVERRIDE:
@@ -665,7 +705,7 @@ def normalize_choice(raw: dict, allowed: list[dict]):
     return None
 
 def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict],
-                    replan: bool) -> tuple[list[dict], str, str]:
+                    replan: bool, trace_path: Path) -> tuple[list[dict], str, str, float]:
     world = compact_world(state, wm, actions)
     instruction = (
         "You are Nova, a persistent survivor inhabiting Cataclysm: Dark Days Ahead. "
@@ -708,7 +748,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         ],
         "options": {"temperature": 0.25},
     }
-    data = ollama_json("/api/chat", payload, timeout=180.0)
+    data, model_latency = ollama_chat_traced(payload, trace_path, timeout=180.0)
     parsed = json.loads(data.get("message", {}).get("content", "{}"))
     candidates = goal_candidates(state, actions)
     by_id = {g["goal_id"]: g for g in candidates}
@@ -776,7 +816,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         extra["combined_score"] = max(0.0, min(1.0, 0.65 * 0.35 + 0.35 * cs + goal_bonus))
         choices.append(extra)
 
-    return choices, goal_id, intention
+    return choices, goal_id, intention, model_latency
 
 def choose_with_variation(choices: list[dict]):
     if not choices:
@@ -824,6 +864,7 @@ def main() -> int:
     model = pick_model()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = LOG_DIR / f"nova-cdda-cognition-{stamp}.jsonl"
+    model_trace_path = LOG_DIR / f"nova-model-trace-{stamp}.jsonl"
     wm = WorldModel()
     feed = ThoughtFeed()
 
@@ -831,6 +872,7 @@ def main() -> int:
     print(f"Run target: {RUN_MINUTES} minutes")
     print(f"Ollama model: {model or 'NOT FOUND - grounded controller fallback'}")
     print(f"Log: {log_path}")
+    print(f"Model trace: {model_trace_path}")
     print()
 
     feed.push("NOVA: waiting for a character to enter the world.")
@@ -845,6 +887,30 @@ def main() -> int:
 
     state = state_from_response(obs)
     wm.observe(state)
+
+    if MODEL_AUDIT:
+        actions = available_actions(state, wm)
+        print()
+        print("MODEL AUDIT: sending one real gameplay-state request to Ollama...")
+        try:
+            options, goal_id, intention, model_latency = qwen_deliberate(
+                model, state, wm, actions, True, model_trace_path
+            )
+        except Exception as exc:
+            print(f"MODEL AUDIT FAILED: {exc!r}")
+            print(f"Trace: {model_trace_path}")
+            return 3
+        print(f"MODEL AUDIT PASSED")
+        print(f"Endpoint: {OLLAMA}/api/chat")
+        print(f"Model: {model}")
+        print(f"Actual model latency: {model_latency:.3f} seconds")
+        print(f"Returned goal_id: {goal_id}")
+        print(f"Returned intention: {intention}")
+        print(f"Validated choices returned: {len(options)}")
+        print(f"Raw request/response trace: {model_trace_path}")
+        print("No game action was dispatched in audit mode.")
+        return 0
+
     deadline = time.monotonic() + RUN_MINUTES * 60
     action_count = 0
 
@@ -853,6 +919,7 @@ def main() -> int:
         actions = available_actions(state, wm)
         safety = deterministic_safety(state, actions)
         model_error = None
+        model_latency_seconds = None
         decision_mode = None
         replan = should_replan(wm, sit, state, actions)
 
@@ -879,8 +946,8 @@ def main() -> int:
 
             if choice is None and model:
                 try:
-                    options, proposed_goal_id, proposed_intention = qwen_deliberate(
-                        model, state, wm, actions, replan
+                    options, proposed_goal_id, proposed_intention, model_latency_seconds = qwen_deliberate(
+                        model, state, wm, actions, replan, model_trace_path
                     )
                     if replan:
                         wm.active_goal_id = proposed_goal_id
@@ -957,7 +1024,10 @@ def main() -> int:
             "command_error": command_error,
             "state_before": state,
             "result": result,
-            "latency_seconds": round(time.monotonic() - started, 3),
+            "bridge_latency_seconds": round(time.monotonic() - started, 3),
+            "model_latency_seconds": (
+                round(model_latency_seconds, 3) if model_latency_seconds is not None else None
+            ),
             "world_model": {
                 "visited_positions": len(wm.visits),
                 "known_tiles": len(wm.known_tiles),
