@@ -102,7 +102,7 @@ def ollama_json(path: str, payload: dict | None = None, timeout: float = 180.0) 
     with request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def ollama_chat_traced(payload: dict, trace_path: Path, timeout: float = 180.0) -> tuple[dict, float]:
+def ollama_chat_traced(payload: dict, trace_path: Path, timeout: float = 180.0) -> tuple[dict, float, dict]:
     url = OLLAMA + "/api/chat"
     request_body = json.dumps(payload, ensure_ascii=False)
     req = request.Request(
@@ -117,6 +117,15 @@ def ollama_chat_traced(payload: dict, trace_path: Path, timeout: float = 180.0) 
             response_body = resp.read().decode("utf-8")
             elapsed = time.monotonic() - started
             status = getattr(resp, "status", None)
+            data = json.loads(response_body)
+            ollama_metrics = {
+                "total_duration_seconds": round(float(data.get("total_duration", 0) or 0) / 1_000_000_000.0, 3),
+                "load_duration_seconds": round(float(data.get("load_duration", 0) or 0) / 1_000_000_000.0, 3),
+                "prompt_eval_duration_seconds": round(float(data.get("prompt_eval_duration", 0) or 0) / 1_000_000_000.0, 3),
+                "eval_duration_seconds": round(float(data.get("eval_duration", 0) or 0) / 1_000_000_000.0, 3),
+                "prompt_eval_count": data.get("prompt_eval_count"),
+                "eval_count": data.get("eval_count"),
+            }
             append_log(trace_path, {
                 "wall_time": utc_now(),
                 "endpoint": url,
@@ -125,8 +134,9 @@ def ollama_chat_traced(payload: dict, trace_path: Path, timeout: float = 180.0) 
                 "response_status": status,
                 "response_body": response_body,
                 "model_latency_seconds": round(elapsed, 3),
+                "ollama_metrics": ollama_metrics,
             })
-            return json.loads(response_body), elapsed
+            return data, elapsed, ollama_metrics
     except Exception as exc:
         elapsed = time.monotonic() - started
         append_log(trace_path, {
@@ -705,7 +715,7 @@ def normalize_choice(raw: dict, allowed: list[dict]):
     return None
 
 def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict],
-                    replan: bool, trace_path: Path) -> tuple[list[dict], str, str, float]:
+                    replan: bool, trace_path: Path) -> tuple[list[dict], str, str, float, dict, int]:
     world = compact_world(state, wm, actions)
     instruction = (
         "You are Nova, a persistent survivor inhabiting Cataclysm: Dark Days Ahead. "
@@ -747,9 +757,11 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
             {"role": "user", "content": json.dumps(world, separators=(",", ":"))},
         ],
         "options": {"temperature": 0.25},
+        "keep_alive": "30m",
     }
-    data, model_latency = ollama_chat_traced(payload, trace_path, timeout=180.0)
+    data, model_latency, ollama_metrics = ollama_chat_traced(payload, trace_path, timeout=180.0)
     parsed = json.loads(data.get("message", {}).get("content", "{}"))
+    raw_choice_count = len(parsed.get("choices", [])) if isinstance(parsed.get("choices", []), list) else 0
     candidates = goal_candidates(state, actions)
     by_id = {g["goal_id"]: g for g in candidates}
     proposed_goal_id = str(parsed.get("goal_id", "")).strip()
@@ -784,6 +796,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
                     goal_bonus += 0.30
                 valid["goal_bonus"] = goal_bonus
                 valid["combined_score"] = max(0.0, min(1.0, 0.65 * qs + 0.35 * cs + goal_bonus))
+                valid["provenance"] = "qwen"
                 choices.append(valid)
                 represented.add((valid.get("action"), valid.get("dx"), valid.get("dy"), valid.get("item_name")))
 
@@ -814,9 +827,10 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
             goal_bonus += 0.30
         extra["goal_bonus"] = goal_bonus
         extra["combined_score"] = max(0.0, min(1.0, 0.65 * 0.35 + 0.35 * cs + goal_bonus))
+        extra["provenance"] = "controller_generated"
         choices.append(extra)
 
-    return choices, goal_id, intention, model_latency
+    return choices, goal_id, intention, model_latency, ollama_metrics, raw_choice_count
 
 def choose_with_variation(choices: list[dict]):
     if not choices:
@@ -893,20 +907,34 @@ def main() -> int:
         print()
         print("MODEL AUDIT: sending one real gameplay-state request to Ollama...")
         try:
-            options, goal_id, intention, model_latency = qwen_deliberate(
-                model, state, wm, actions, True, model_trace_path
-            )
+            first = qwen_deliberate(model, state, wm, actions, True, model_trace_path)
+            options1, goal_id1, intention1, latency1, metrics1, raw_count1 = first
+            time.sleep(1.0)
+            second = qwen_deliberate(model, state, wm, actions, True, model_trace_path)
+            options2, goal_id2, intention2, latency2, metrics2, raw_count2 = second
         except Exception as exc:
             print(f"MODEL AUDIT FAILED: {exc!r}")
             print(f"Trace: {model_trace_path}")
             return 3
-        print(f"MODEL AUDIT PASSED")
+
+        qwen_valid1 = sum(1 for x in options1 if x.get("provenance") == "qwen")
+        controller_added1 = sum(1 for x in options1 if x.get("provenance") == "controller_generated")
+        qwen_valid2 = sum(1 for x in options2 if x.get("provenance") == "qwen")
+        controller_added2 = sum(1 for x in options2 if x.get("provenance") == "controller_generated")
+
+        print("MODEL AUDIT PASSED")
         print(f"Endpoint: {OLLAMA}/api/chat")
         print(f"Model: {model}")
-        print(f"Actual model latency: {model_latency:.3f} seconds")
-        print(f"Returned goal_id: {goal_id}")
-        print(f"Returned intention: {intention}")
-        print(f"Validated choices returned: {len(options)}")
+        print("keep_alive: 30m")
+        print()
+        print(f"CALL 1 latency: {latency1:.3f}s | Ollama load: {metrics1.get('load_duration_seconds')}s")
+        print(f"CALL 1 raw Qwen choices: {raw_count1} | validated Qwen: {qwen_valid1} | controller-added: {controller_added1} | final pool: {len(options1)}")
+        print(f"CALL 1 goal_id: {goal_id1}")
+        print()
+        print(f"CALL 2 latency: {latency2:.3f}s | Ollama load: {metrics2.get('load_duration_seconds')}s")
+        print(f"CALL 2 raw Qwen choices: {raw_count2} | validated Qwen: {qwen_valid2} | controller-added: {controller_added2} | final pool: {len(options2)}")
+        print(f"CALL 2 goal_id: {goal_id2}")
+        print()
         print(f"Raw request/response trace: {model_trace_path}")
         print("No game action was dispatched in audit mode.")
         return 0
@@ -920,7 +948,10 @@ def main() -> int:
         safety = deterministic_safety(state, actions)
         model_error = None
         model_latency_seconds = None
+        model_metrics = None
+        model_raw_choice_count = None
         decision_mode = None
+        selected_provenance = None
         replan = should_replan(wm, sit, state, actions)
 
         feed.push("SEE: " + describe_situation(sit))
@@ -928,6 +959,7 @@ def main() -> int:
         if safety:
             choice, reason = safety
             decision_mode = "safety"
+            selected_provenance = "safety"
             intention = wm.active_intention or "stay alive and stabilize immediate needs"
             feed.push("INTENT: " + intention)
         else:
@@ -939,6 +971,7 @@ def main() -> int:
                 choice = fast_frontier_choice(state, wm, actions)
                 if choice:
                     decision_mode = "fast_frontier"
+                    selected_provenance = "controller_fast_path"
                     wm.active_goal_id = "explore_frontier"
                     wm.active_intention = "explore nearby unvisited space and update the local map"
                     intention = wm.active_intention
@@ -946,7 +979,7 @@ def main() -> int:
 
             if choice is None and model:
                 try:
-                    options, proposed_goal_id, proposed_intention, model_latency_seconds = qwen_deliberate(
+                    options, proposed_goal_id, proposed_intention, model_latency_seconds, model_metrics, model_raw_choice_count = qwen_deliberate(
                         model, state, wm, actions, replan, model_trace_path
                     )
                     if replan:
@@ -960,13 +993,20 @@ def main() -> int:
                     choice = choose_with_variation(options)
                     if choice:
                         decision_mode = "qwen"
-                        reason = choice.get("reason") or "Qwen selected this as progress toward the intention"
+                        selected_provenance = choice.get("provenance")
+                        if choice.get("reason"):
+                            reason = choice.get("reason")
+                        elif selected_provenance == "qwen":
+                            reason = "Qwen returned this legal choice without a reason string"
+                        else:
+                            reason = "controller-generated grounded candidate selected after Qwen deliberation"
                 except Exception as exc:
                     model_error = repr(exc)
 
             if not choice:
                 choice, reason = fallback_choice(state, wm, actions)
                 decision_mode = "fallback"
+                selected_provenance = "fallback"
                 if not wm.active_intention:
                     fallback_goal = choose_fallback_goal(goal_candidates(state, actions))
                     wm.active_goal_id = fallback_goal["goal_id"]
@@ -1014,6 +1054,9 @@ def main() -> int:
             "action_index": action_count,
             "model": model,
             "decision_mode": decision_mode,
+            "selected_provenance": selected_provenance,
+            "model_raw_choice_count": model_raw_choice_count,
+            "model_metrics": model_metrics,
             "situation": sit,
             "active_goal_id": wm.active_goal_id,
             "active_intention": wm.active_intention,
