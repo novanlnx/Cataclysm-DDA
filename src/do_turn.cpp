@@ -682,6 +682,19 @@ static bool wait_for_turn_action( avatar &u, map &m )
                                 "dx and dy must each be -1, 0, or 1 and may not both be 0" );
                 continue;
             }
+
+            // Nova bridge actions must never block on an interactive confirmation
+            // dialog. Native movement can prompt before entering dangerous terrain
+            // (for example "Really step into rose bush?"). Treat that destination
+            // as a blocked edge and let the controller choose another route.
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            if( m.inbounds( target ) && g->is_dangerous_tile( target ) ) {
+                write_response( dir, command_id, action, false, "blocked",
+                                before, before, false, false,
+                                "dangerous_tile_requires_confirmation" );
+                continue;
+            }
+
             const bool handled = avatar_action::move( u, m, tripoint_rel_ms( dx, dy, 0 ) );
             const state_snapshot after = snapshot( u );
             const bool position_changed = before.x != after.x || before.y != after.y || before.z != after.z;
