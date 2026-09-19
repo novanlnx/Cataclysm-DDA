@@ -149,6 +149,7 @@ class WorldModel:
     recent_actions: deque = field(default_factory=lambda: deque(maxlen=12))
     seen_hostiles: dict[str, dict] = field(default_factory=dict)
     blocked_edges: set[tuple[int, int, int, int, int, int]] = field(default_factory=set)
+    active_goal_id: str = ""
     active_intention: str = ""
     intention_age: int = 0
     progress_epoch: int = 0
@@ -298,6 +299,74 @@ def describe_situation(s: dict) -> str:
         parts.append("repeating path")
     return "; ".join(parts)
 
+def goal_candidates(state: dict, actions: list[dict]) -> list[dict]:
+    candidates = []
+    action_names = {a.get("action") for a in actions}
+
+    if "drink_best" in action_names and int(state.get("thirst", 0) or 0) > 20:
+        candidates.append({
+            "goal_id": "reduce_thirst",
+            "intention": "drink something safe to reduce thirst",
+            "supported_by": ["drink_best"],
+            "priority": 0.98,
+        })
+    if "eat_best_food" in action_names and int(state.get("hunger", 0) or 0) > 20:
+        candidates.append({
+            "goal_id": "reduce_hunger",
+            "intention": "eat something safe to reduce hunger",
+            "supported_by": ["eat_best_food"],
+            "priority": 0.96,
+        })
+    if "pickup_consumable" in action_names:
+        candidates.append({
+            "goal_id": "acquire_consumable",
+            "intention": "collect nearby food or drink that can be stored safely",
+            "supported_by": ["pickup_consumable"],
+            "priority": 0.88,
+        })
+    if "open_adjacent" in action_names:
+        candidates.append({
+            "goal_id": "open_boundary",
+            "intention": "open a promising nearby boundary and reassess the area",
+            "supported_by": ["open_adjacent", "move_one_tile"],
+            "priority": 0.76,
+        })
+    if any(a.get("action") == "move_one_tile" and int(a.get("visits_target", 0) or 0) == 0 for a in actions):
+        candidates.append({
+            "goal_id": "explore_frontier",
+            "intention": "explore nearby unvisited space and update the local map",
+            "supported_by": ["move_one_tile", "open_adjacent"],
+            "priority": 0.72,
+        })
+    if "wait_one_turn" in action_names:
+        candidates.append({
+            "goal_id": "recover_stamina",
+            "intention": "pause briefly to recover stamina",
+            "supported_by": ["wait_one_turn"],
+            "priority": 0.40,
+        })
+
+    if not candidates:
+        candidates.append({
+            "goal_id": "safe_progress",
+            "intention": "make the safest available local progress",
+            "supported_by": sorted(action_names),
+            "priority": 0.20,
+        })
+    return candidates
+
+def choose_fallback_goal(candidates: list[dict]) -> dict:
+    return max(candidates, key=lambda g: float(g.get("priority", 0.0)))
+
+def goal_still_supported(wm: WorldModel, actions: list[dict], state: dict) -> bool:
+    if not wm.active_goal_id:
+        return False
+    for goal in goal_candidates(state, actions):
+        if goal.get("goal_id") == wm.active_goal_id:
+            supported = set(goal.get("supported_by") or [])
+            return any(a.get("action") in supported for a in actions)
+    return False
+
 def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     actions = []
     tiles = tile_map(state)
@@ -439,8 +508,10 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         )},
         "position": state.get("position"),
         "activity": state.get("activity"),
+        "active_goal_id": wm.active_goal_id or None,
         "active_intention": wm.active_intention or None,
         "intention_age_actions": wm.intention_age,
+        "goal_candidates": goal_candidates(state, actions),
         "allowed_actions": actions,
         "recent_actions": list(wm.recent_actions)[-8:],
         "recent_positions": list(wm.recent_positions)[-8:],
@@ -502,16 +573,15 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     )
     if replan:
         instruction += (
-            "Set intention to one short practical goal for the next several actions. "
-            "It should describe what you are trying to accomplish, not merely 'explore cautiously'. "
+            "Choose exactly one goal_id from goal_candidates. Do not invent a new goal and do not target "
+            "visible objects that cannot be acted on by the current allowed_actions. "
         )
     else:
         instruction += (
-            "Keep serving active_intention unless safety or new evidence makes it clearly obsolete. "
-            "Repeat the active intention unchanged in the intention field. "
+            "Keep serving active_goal_id unless safety or new evidence makes it clearly obsolete. "
         )
     instruction += (
-        'Schema: {"intention":"short goal","choices":['
+        'Schema: {"goal_id":"exact candidate id","choices":['
         '{"action":"exact action","dx":0,"dy":0,"item_name":"exact visible item name","duration_minutes":480,'
         '"score":0.0,"reason":"one short evidence-grounded reason"}]}. '
         "Return up to 3 choices."
@@ -529,7 +599,14 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     }
     data = ollama_json("/api/chat", payload, timeout=180.0)
     parsed = json.loads(data.get("message", {}).get("content", "{}"))
-    intention = " ".join(str(parsed.get("intention", "")).split())[:180]
+    candidates = goal_candidates(state, actions)
+    by_id = {g["goal_id"]: g for g in candidates}
+    proposed_goal_id = str(parsed.get("goal_id", "")).strip()
+    chosen_goal = by_id.get(proposed_goal_id)
+    if chosen_goal is None:
+        chosen_goal = choose_fallback_goal(candidates)
+    intention = str(chosen_goal["intention"])
+    goal_id = str(chosen_goal["goal_id"])
     choices = []
     represented = set()
     for raw in parsed.get("choices", [])[:3]:
@@ -556,7 +633,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
         extra["combined_score"] = 0.65 * 0.35 + 0.35 * cs
         choices.append(extra)
 
-    return choices, intention
+    return choices, goal_id, intention
 
 def choose_with_variation(choices: list[dict]):
     if not choices:
@@ -575,8 +652,10 @@ def fallback_choice(state: dict, wm: WorldModel, actions: list[dict]):
     choice = max(sane, key=lambda a: float(a.get("controller_score", 0.0)))
     return choice, "controller fallback: highest grounded progress"
 
-def should_replan(wm: WorldModel, situation: dict) -> bool:
-    if not wm.active_intention:
+def should_replan(wm: WorldModel, situation: dict, state: dict, actions: list[dict]) -> bool:
+    if not wm.active_intention or not wm.active_goal_id:
+        return True
+    if not goal_still_supported(wm, actions, state):
         return True
     if wm.intention_age >= 6:
         return True
@@ -631,7 +710,7 @@ def main() -> int:
         actions = available_actions(state, wm)
         safety = deterministic_safety(state, actions)
         model_error = None
-        replan = should_replan(wm, sit)
+        replan = should_replan(wm, sit, state, actions)
 
         feed.push("SEE: " + describe_situation(sit))
 
@@ -646,11 +725,15 @@ def main() -> int:
 
             if model:
                 try:
-                    options, proposed_intention = qwen_deliberate(model, state, wm, actions, replan)
-                    if replan and proposed_intention:
+                    options, proposed_goal_id, proposed_intention = qwen_deliberate(
+                        model, state, wm, actions, replan
+                    )
+                    if replan:
+                        wm.active_goal_id = proposed_goal_id
                         wm.active_intention = proposed_intention
                         wm.intention_age = 0
-                    elif not wm.active_intention and proposed_intention:
+                    elif not wm.active_intention:
+                        wm.active_goal_id = proposed_goal_id
                         wm.active_intention = proposed_intention
                     intention = wm.active_intention
                     choice = choose_with_variation(options)
@@ -662,7 +745,9 @@ def main() -> int:
             if not choice:
                 choice, reason = fallback_choice(state, wm, actions)
                 if not wm.active_intention:
-                    wm.active_intention = "expand known territory without repeating the same path"
+                    fallback_goal = choose_fallback_goal(goal_candidates(state, actions))
+                    wm.active_goal_id = fallback_goal["goal_id"]
+                    wm.active_intention = fallback_goal["intention"]
                 intention = wm.active_intention
 
             feed.push("INTENT: " + (intention or "make grounded progress"))
@@ -706,6 +791,7 @@ def main() -> int:
             "action_index": action_count,
             "model": model,
             "situation": sit,
+            "active_goal_id": wm.active_goal_id,
             "active_intention": wm.active_intention,
             "replanned": replan,
             "selected": choice,
