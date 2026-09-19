@@ -27,6 +27,17 @@ CARDINALS = {
     "east": (1, 0),
 }
 
+MOVE_DIRECTIONS = {
+    "north": (0, -1),
+    "northeast": (1, -1),
+    "east": (1, 0),
+    "southeast": (1, 1),
+    "south": (0, 1),
+    "southwest": (-1, 1),
+    "west": (-1, 0),
+    "northwest": (-1, -1),
+}
+
 # Hard validation gate.  No controller path -- Qwen, deterministic safety,
 # fallback, or future helper code -- may dispatch outside this set.
 VALIDATION_DISPATCH_ALLOWLIST = {
@@ -203,6 +214,8 @@ class WorldModel:
     active_intention: str = ""
     intention_age: int = 0
     progress_epoch: int = 0
+    no_progress_streak: int = 0
+    goal_no_progress: dict[str, int] = field(default_factory=dict)
 
     def observe(self, state: dict) -> None:
         p = pos_tuple(state)
@@ -236,7 +249,8 @@ class WorldModel:
     def is_known_blocked_edge(self, state: dict, dx: int, dy: int) -> bool:
         return self.edge_key(state, dx, dy) in self.blocked_edges
 
-    def record_action(self, state_before: dict, choice: dict, outcome: str) -> None:
+    def record_action(self, state_before: dict, choice: dict, outcome: str,
+                      result: dict | None = None) -> None:
         self.recent_actions.append({
             "action": choice.get("action"),
             "dx": choice.get("dx"),
@@ -250,6 +264,34 @@ class WorldModel:
                 )
             except Exception:
                 pass
+
+        before = (result or {}).get("before") or state_before or {}
+        after = (result or {}).get("after") or before
+        progress = outcome in {"moved", "opened", "pickup_verified"}
+        if not progress:
+            try:
+                progress = (
+                    pos_tuple(before) != pos_tuple(after)
+                    or int(after.get("inventory_count", 0) or 0) > int(before.get("inventory_count", 0) or 0)
+                    or int(after.get("stamina", 0) or 0) > int(before.get("stamina", 0) or 0) + 10
+                    or int(after.get("stored_kcal", 0) or 0) > int(before.get("stored_kcal", 0) or 0) + 10
+                    or int(after.get("hunger", 0) or 0) < int(before.get("hunger", 0) or 0) - 4
+                    or int(after.get("thirst", 0) or 0) < int(before.get("thirst", 0) or 0) - 4
+                )
+            except Exception:
+                progress = False
+
+        goal_id = self.active_goal_id
+        if progress:
+            self.no_progress_streak = 0
+            if goal_id:
+                self.goal_no_progress[goal_id] = 0
+            self.progress_epoch += 1
+        else:
+            self.no_progress_streak += 1
+            if goal_id:
+                self.goal_no_progress[goal_id] = self.goal_no_progress.get(goal_id, 0) + 1
+
         self.intention_age += 1
 
     def visit_count_target(self, state: dict, dx: int, dy: int) -> int:
@@ -294,11 +336,11 @@ def situation_summary(state: dict, wm: WorldModel) -> dict:
     open_moves = []
     for name, (dx, dy) in CARDINALS.items():
         t = tiles.get((dx, dy))
-        if not t:
-            continue
-        if t.get("openable"):
+        if t and t.get("openable"):
             doors.append({"direction": name, "terrain": t.get("terrain", "")})
-        if t.get("passable"):
+    for name, (dx, dy) in MOVE_DIRECTIONS.items():
+        t = tiles.get((dx, dy))
+        if t and t.get("passable"):
             open_moves.append(name)
 
     hostiles = []
@@ -383,7 +425,7 @@ def resource_need_weight(state: dict, resource: dict) -> float:
         weight += min(0.25, hunger / 300.0)
     return weight
 
-def goal_candidates(state: dict, actions: list[dict]) -> list[dict]:
+def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = None) -> list[dict]:
     candidates = []
     action_names = {a.get("action") for a in actions}
 
@@ -438,13 +480,29 @@ def goal_candidates(state: dict, actions: list[dict]) -> list[dict]:
             "supported_by": ["move_one_tile", "open_adjacent"],
             "priority": 0.72,
         })
-    if "wait_one_turn" in action_names:
+    stamina = int(state.get("stamina", 0) or 0)
+    stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+    stamina_ratio = stamina / stamina_max
+    wait_actions = [a for a in actions if a.get("action") == "wait_one_turn"]
+    if wait_actions and stamina_ratio < 0.70:
         candidates.append({
             "goal_id": "recover_stamina",
-            "intention": "pause briefly to recover stamina",
+            "intention": "pause briefly because stamina is genuinely low",
             "supported_by": ["wait_one_turn"],
-            "priority": 0.40,
+            "priority": min(0.90, 0.45 + (0.70 - stamina_ratio)),
         })
+    elif any(a.get("wait_reason") == "stalled" for a in wait_actions):
+        candidates.append({
+            "goal_id": "reassess_stall",
+            "intention": "wait once and reassess because no safe local movement is currently available",
+            "supported_by": ["wait_one_turn"],
+            "priority": 0.10,
+        })
+
+    if wm and wm.active_goal_id and wm.goal_no_progress.get(wm.active_goal_id, 0) >= 4:
+        alternatives = [g for g in candidates if g.get("goal_id") != wm.active_goal_id]
+        if alternatives:
+            candidates = alternatives
 
     if not candidates:
         candidates.append({
@@ -461,7 +519,7 @@ def choose_fallback_goal(candidates: list[dict]) -> dict:
 def goal_still_supported(wm: WorldModel, actions: list[dict], state: dict) -> bool:
     if not wm.active_goal_id:
         return False
-    for goal in goal_candidates(state, actions):
+    for goal in goal_candidates(state, actions, wm):
         if goal.get("goal_id") == wm.active_goal_id:
             supported = set(goal.get("supported_by") or [])
             return any(a.get("action") in supported for a in actions)
@@ -476,31 +534,32 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 
     for name, (dx, dy) in CARDINALS.items():
         t = tiles.get((dx, dy))
+        if not t or not t.get("openable"):
+            continue
+        terrain = str(t.get("terrain", ""))
+        lower_terrain = terrain.lower()
+        is_curtain = "curtain" in lower_terrain
+        if is_curtain:
+            score = 0.48 + (0.08 if state.get("indoors") else 0.0)
+            label = f"open {name} curtains"
+            progress = "improves visibility but is not an exit"
+        else:
+            score = 0.78 + (0.12 if state.get("indoors") else 0.0) + (0.08 if loop else 0.0)
+            label = f"open {name} {terrain or 'door'}"
+            progress = "reveals/accesses a new boundary"
+        actions.append({
+            "action": "open_adjacent", "dx": dx, "dy": dy,
+            "label": label,
+            "controller_score": min(1.0, score),
+            "progress": progress,
+        })
+
+    for name, (dx, dy) in MOVE_DIRECTIONS.items():
+        t = tiles.get((dx, dy))
         if not t:
             continue
-
         visits = wm.visit_count_target(state, dx, dy)
         backtrack = wm.is_immediate_backtrack(state, dx, dy)
-
-        if t.get("openable"):
-            terrain = str(t.get("terrain", ""))
-            lower_terrain = terrain.lower()
-            is_curtain = "curtain" in lower_terrain
-            if is_curtain:
-                score = 0.48 + (0.08 if state.get("indoors") else 0.0)
-                label = f"open {name} curtains"
-                progress = "improves visibility but is not an exit"
-            else:
-                # A closed door/boundary is strong progress when indoors or looping.
-                score = 0.78 + (0.12 if state.get("indoors") else 0.0) + (0.08 if loop else 0.0)
-                label = f"open {name} {terrain or 'door'}"
-                progress = "reveals/accesses a new boundary"
-            actions.append({
-                "action": "open_adjacent", "dx": dx, "dy": dy,
-                "label": label,
-                "controller_score": min(1.0, score),
-                "progress": progress,
-            })
 
         if t.get("passable"):
             # A native CDDA refusal is evidence.  Do not hammer the same
@@ -599,11 +658,20 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 
     stamina = int(state.get("stamina", 0) or 0)
     stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
-    if stamina / stamina_max < 0.7 or not actions:
+    stamina_ratio = stamina / stamina_max
+    if stamina_ratio < 0.7:
         actions.append({
             "action": "wait_one_turn",
-            "label": "pause briefly",
-            "controller_score": 0.2 if stamina / stamina_max >= 0.25 else 0.8,
+            "label": "pause briefly to recover genuinely low stamina",
+            "controller_score": 0.2 if stamina_ratio >= 0.25 else 0.8,
+            "wait_reason": "recover_stamina",
+        })
+    elif not actions:
+        actions.append({
+            "action": "wait_one_turn",
+            "label": "wait once and reassess local options",
+            "controller_score": 0.05,
+            "wait_reason": "stalled",
         })
 
     return actions
@@ -669,7 +737,9 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         "active_goal_id": wm.active_goal_id or None,
         "active_intention": wm.active_intention or None,
         "intention_age_actions": wm.intention_age,
-        "goal_candidates": goal_candidates(state, actions),
+        "no_progress_streak": wm.no_progress_streak,
+        "active_goal_no_progress": wm.goal_no_progress.get(wm.active_goal_id, 0),
+        "goal_candidates": goal_candidates(state, actions, wm),
         "allowed_actions": actions,
         "recent_actions": list(wm.recent_actions)[-8:],
         "recent_positions": list(wm.recent_positions)[-8:],
@@ -762,7 +832,7 @@ def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict]
     data, model_latency, ollama_metrics = ollama_chat_traced(payload, trace_path, timeout=180.0)
     parsed = json.loads(data.get("message", {}).get("content", "{}"))
     raw_choice_count = len(parsed.get("choices", [])) if isinstance(parsed.get("choices", []), list) else 0
-    candidates = goal_candidates(state, actions)
+    candidates = goal_candidates(state, actions, wm)
     by_id = {g["goal_id"]: g for g in candidates}
     proposed_goal_id = str(parsed.get("goal_id", "")).strip()
     chosen_goal = by_id.get(proposed_goal_id)
@@ -853,6 +923,8 @@ def should_replan(wm: WorldModel, situation: dict, state: dict, actions: list[di
     if not wm.active_intention or not wm.active_goal_id:
         return True
     if not goal_still_supported(wm, actions, state):
+        return True
+    if wm.goal_no_progress.get(wm.active_goal_id, 0) >= 4:
         return True
     if wm.intention_age >= 6:
         return True
@@ -956,6 +1028,25 @@ def main() -> int:
 
         feed.push("SEE: " + describe_situation(sit))
 
+        stall_only = (
+            len(actions) == 1
+            and actions[0].get("action") == "wait_one_turn"
+            and actions[0].get("wait_reason") == "stalled"
+        )
+        if stall_only and wm.no_progress_streak >= 2:
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "validation_stop": "stalled_no_progress",
+                "position": state.get("position"),
+                "stamina": state.get("stamina"),
+                "stamina_max": state.get("stamina_max"),
+                "known_blocked_edges": len(wm.blocked_edges),
+                "no_progress_streak": wm.no_progress_streak,
+            })
+            feed.push("STOP: no safe local progress after blocked-edge reassessment.")
+            print("VALIDATION STOP: no safe local progress after blocked-edge reassessment.")
+            break
+
         if safety:
             choice, reason = safety
             decision_mode = "safety"
@@ -967,7 +1058,15 @@ def main() -> int:
             reason = ""
             intention = wm.active_intention
 
-            if not needs_qwen_judgment(state, wm, actions):
+            if stall_only:
+                choice = dict(actions[0])
+                decision_mode = "stall_reassess"
+                selected_provenance = "controller_stall_guard"
+                wm.active_goal_id = "reassess_stall"
+                wm.active_intention = "wait once and reassess because no safe local movement is currently available"
+                intention = wm.active_intention
+                reason = "deterministic one-turn reassessment; stamina is not being claimed as low"
+            elif not needs_qwen_judgment(state, wm, actions):
                 choice = fast_frontier_choice(state, wm, actions)
                 if choice:
                     decision_mode = "fast_frontier"
@@ -1008,7 +1107,7 @@ def main() -> int:
                 decision_mode = "fallback"
                 selected_provenance = "fallback"
                 if not wm.active_intention:
-                    fallback_goal = choose_fallback_goal(goal_candidates(state, actions))
+                    fallback_goal = choose_fallback_goal(goal_candidates(state, actions, wm))
                     wm.active_goal_id = fallback_goal["goal_id"]
                     wm.active_intention = fallback_goal["intention"]
                 intention = wm.active_intention
@@ -1076,6 +1175,8 @@ def main() -> int:
                 "known_tiles": len(wm.known_tiles),
                 "loop_detected": wm.looping(),
                 "known_blocked_edges": len(wm.blocked_edges),
+                "no_progress_streak": wm.no_progress_streak,
+                "active_goal_no_progress": wm.goal_no_progress.get(wm.active_goal_id, 0),
             },
         }
         append_log(log_path, record)
@@ -1085,7 +1186,7 @@ def main() -> int:
             break
 
         print(f"[{action_count}] {action}: {outcome} | mode={decision_mode} | goal={wm.active_intention!r} | {reason[:90]}")
-        wm.record_action(state, choice, outcome)
+        wm.record_action(state, choice, outcome, result)
 
         previous_state = state
         try:
