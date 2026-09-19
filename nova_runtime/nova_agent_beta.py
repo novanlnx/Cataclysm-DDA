@@ -76,6 +76,7 @@ CRITICAL_NEED_THRESHOLD = 80
 STAMINA_LOW_RATIO = 0.35
 LESSON_MATCH_THRESHOLD = 3
 LESSON_ACTION_BIAS = 0.35
+FAST_FRONTIER_MOVES = 64
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -273,7 +274,7 @@ def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
         write_command_atomic(command_path, payload)
         deadline = time.monotonic() + timeout
 
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             if response_path.exists():
                 try:
                     data = json.loads(response_path.read_text(encoding="utf-8"))
@@ -1296,8 +1297,8 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     return actions
 
 def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> bool:
-    # Qwen is for judgment, not footsteps.  Empty frontier walking should be
-    # immediate; deliberate when something actionable or risky appears.
+    # Qwen is for judgment, not footsteps. Empty, repetitive traversal should
+    # stay fast until something appears that can materially change the choice.
     if wm.looping():
         return True
     if any(str(c.get("attitude", "")).lower() == "hostile"
@@ -1306,6 +1307,9 @@ def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> boo
     if any(t.get("openable") for t in state.get("local_tiles", [])):
         return True
     if any(a.get("action") in {"pickup_consumable", "eat_best_food", "drink_best"}
+           for a in actions):
+        return True
+    if any(a.get("lesson_bias") or a.get("threat_response") or a.get("shelter_preference")
            for a in actions):
         return True
     if visible_storable_consumables(state):
@@ -1326,6 +1330,27 @@ def fast_frontier_choice(state: dict, wm: WorldModel, actions: list[dict]):
     out["decision_mode"] = "fast_frontier"
     out["reason"] = "deterministic frontier step; nothing currently requires deliberation"
     return out
+
+def fast_frontier_plan(state: dict, actions: list[dict]) -> Plan:
+    return Plan(
+        plan_id=uuid.uuid4().hex,
+        goal_id="explore_frontier",
+        intention="move quickly through uneventful terrain until something meaningful requires judgment",
+        steps=[PlanStep(
+            kind="explore",
+            params={"max_successful_moves": FAST_FRONTIER_MOVES, "successful_moves": 0},
+            completion={"type": "explore_budget"},
+        )],
+        created_turn=current_turn(state),
+        interruption_conditions=[
+            "meaningful_judgment_event",
+            "urgent_need_floor_crossing",
+            "hostile_within_5",
+            "current_step_failed_twice",
+        ],
+        planner_reason="deterministic fast frontier: nothing currently requires Qwen judgment",
+        provenance="fast_frontier",
+    )
 
 def deterministic_safety(state: dict, actions: list[dict]):
     def find(name: str):
@@ -1731,6 +1756,9 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
     step = plan.current_step
     if step is None:
         return "plan_complete"
+
+    if plan.provenance == "fast_frontier" and needs_qwen_judgment(state, wm, actions):
+        return "meaningful_judgment_event"
 
     safety = deterministic_safety(state, actions)
     if safety:
@@ -2348,7 +2376,10 @@ def main() -> int:
     )
 
     print("NOVA EVOLUTION — PLANNER + EXECUTOR + LIFE LOOP")
-    print(f"Run target: {RUN_MINUTES} minutes")
+    if RUN_MINUTES <= 0:
+        print("Run target: until real death, transport failure, or manual stop")
+    else:
+        print(f"Run target: {RUN_MINUTES} minutes")
     print(f"Ollama model: {model or 'NOT FOUND - deterministic planner fallback'}")
     print(f"Log: {log_path}")
     print(f"Model trace: {model_trace_path}")
@@ -2445,7 +2476,7 @@ def main() -> int:
     )
     life_number = life.life_number
     log_life_started(log_path, life, resumed_existing_attempt)
-    deadline = time.monotonic() + RUN_MINUTES * 60
+    deadline = None if RUN_MINUTES <= 0 else time.monotonic() + RUN_MINUTES * 60
     action_count = 0
     plan: Plan | None = None
 
@@ -2520,6 +2551,8 @@ def main() -> int:
     
                 if safety:
                     plan = safety_plan(state, actions, safety)
+                elif not needs_qwen_judgment(state, wm, actions):
+                    plan = fast_frontier_plan(state, actions)
                 elif model:
                     try:
                         plan, model_latency_seconds, model_metrics, _ = qwen_plan(
