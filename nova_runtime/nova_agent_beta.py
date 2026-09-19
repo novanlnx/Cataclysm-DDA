@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -19,10 +20,14 @@ RUN_MINUTES = int(os.environ.get("NOVA_RUN_MINUTES", "60"))
 MODEL_OVERRIDE = os.environ.get("NOVA_MODEL", "").strip()
 MODEL_AUDIT = os.environ.get("NOVA_MODEL_AUDIT", "").strip().lower() in {"1", "true", "yes", "on"}
 
-EVOLUTION_SCHEMA_VERSION = 1
+EVOLUTION_STATE_VERSION = 1
+LIFE_RECORD_SCHEMA_VERSION = 1
+LIFE_STATUS_SCHEMA_VERSION = 1
 LIFE_STATUS_PATH = BRIDGE / "life-status.json"
 EVOLUTION_STATE_PATH = STATE_DIR / "nova-evolution-state-v1.json"
 LIFE_HISTORY_PATH = STATE_DIR / "nova-life-history-v1.jsonl"
+ACTIVE_LIFE_PATH = STATE_DIR / "nova-active-life-v1.json"
+CONSUMED_LIFE_STATUS_PATH = STATE_DIR / "nova-consumed-life-status-v1.json"
 
 CARDINALS = {
     "north": (0, -1),
@@ -100,13 +105,43 @@ def read_json_safe(path: Path) -> dict | None:
         return None
 
 def read_life_status() -> dict | None:
-    return read_json_safe(LIFE_STATUS_PATH)
+    status = read_json_safe(LIFE_STATUS_PATH)
+    if not status:
+        return None
+    if int(status.get("schema_version", -1)) != LIFE_STATUS_SCHEMA_VERSION:
+        return None
+    return status
+
+def life_status_signature(status: dict | None) -> str | None:
+    if not status or str(status.get("status", "")) != "dead":
+        return None
+    payload = {
+        "schema_version": status.get("schema_version"),
+        "turn": status.get("turn"),
+        "position": status.get("position"),
+        "status": status.get("status"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+def archive_consumed_life_status(status: dict | None) -> None:
+    if status:
+        write_json_atomic(CONSUMED_LIFE_STATUS_PATH, {
+            "schema_version": LIFE_STATUS_SCHEMA_VERSION,
+            "consumed_at": utc_now(),
+            "status": status,
+        })
+    try:
+        LIFE_STATUS_PATH.unlink()
+    except OSError:
+        pass
 
 def load_evolution_state() -> dict:
     state = read_json_safe(EVOLUTION_STATE_PATH) or {}
-    if int(state.get("version", -1)) != EVOLUTION_SCHEMA_VERSION:
+    if int(state.get("version", -1)) != EVOLUTION_STATE_VERSION:
         return {
-            "version": EVOLUTION_SCHEMA_VERSION,
+            "version": EVOLUTION_STATE_VERSION,
             "life_number": 1,
             "lives_completed": 0,
         }
@@ -116,17 +151,17 @@ def load_evolution_state() -> dict:
 
 def save_evolution_state(state: dict) -> None:
     payload = dict(state)
-    payload["version"] = EVOLUTION_SCHEMA_VERSION
+    payload["version"] = EVOLUTION_STATE_VERSION
     write_json_atomic(EVOLUTION_STATE_PATH, payload)
 
 def append_life_history(record: dict) -> None:
     LIFE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(record)
-    payload["version"] = EVOLUTION_SCHEMA_VERSION
+    payload["schema_version"] = LIFE_RECORD_SCHEMA_VERSION
     with LIFE_HISTORY_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-def load_recent_life_history(limit: int = 5) -> list[dict]:
+def load_recent_life_history(limit: int = 5, include_aborted: bool = False) -> list[dict]:
     if not LIFE_HISTORY_PATH.exists():
         return []
     try:
@@ -134,13 +169,21 @@ def load_recent_life_history(limit: int = 5) -> list[dict]:
     except OSError:
         return []
     out = []
-    for line in lines[-max(1, limit):]:
+    for line in reversed(lines):
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(item, dict) and int(item.get("version", -1)) == EVOLUTION_SCHEMA_VERSION:
-            out.append(item)
+        if not isinstance(item, dict):
+            continue
+        if int(item.get("schema_version", -1)) != LIFE_RECORD_SCHEMA_VERSION:
+            continue
+        if not include_aborted and item.get("terminal_state") != "dead":
+            continue
+        out.append(item)
+        if len(out) >= max(1, limit):
+            break
+    out.reverse()
     return out
 
 def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
@@ -169,7 +212,7 @@ def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
                     pass
                 return data
         life_status = read_life_status()
-        if life_status and bool(life_status.get("dead")):
+        if life_status and str(life_status.get("status", "")) == "dead":
             raise LifeEnded(life_status)
         time.sleep(0.05)
     raise TimeoutError(f"Timed out waiting for CDDA response to {action} ({command_id})")
@@ -1202,10 +1245,6 @@ def compact_planner_world(state: dict, wm: WorldModel, actions: list[dict]) -> d
         "controller_executes_steps": True,
         "maximum_plan_steps": 5,
     }
-    # Phase-1 reincarnation memory: raw structured summaries from previous
-    # lives. Reflection/semantic lessons come after the death lifecycle itself
-    # is empirically proven.
-    base["cross_life_history"] = load_recent_life_history(5)
     return base
 
 def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
@@ -1452,32 +1491,351 @@ def append_log(path: Path, record: dict) -> None:
 def command_kwargs(choice: dict) -> dict:
     return {k: choice[k] for k in ("dx", "dy", "item_name", "duration_minutes") if k in choice}
 
-def record_life_end(evolution_state: dict, life_number: int,
-                    life_started_monotonic: float, last_state: dict,
-                    wm: WorldModel, plan: Plan | None,
-                    death_status: dict, log_path: Path) -> None:
-    record = {
-        "event": "life_end",
-        "life_number": life_number,
-        "wall_time": utc_now(),
-        "lifetime_seconds": round(max(0.0, time.monotonic() - life_started_monotonic), 3),
-        "last_known_turn": last_state.get("turn"),
-        "last_known_position": last_state.get("position"),
-        "death_status": death_status,
-        "recent_actions": list(wm.recent_actions)[-12:],
-        "active_plan": plan.to_dict() if plan else None,
+def compact_state_for_hash(state: dict) -> dict:
+    return {
+        "turn": state.get("turn"),
+        "position": state.get("position"),
+        "hunger": state.get("hunger"),
+        "thirst": state.get("thirst"),
+        "sleepiness": state.get("sleepiness"),
+        "stamina": state.get("stamina"),
+        "stamina_max": state.get("stamina_max"),
+        "pain": state.get("pain"),
+        "morale": state.get("morale"),
+        "activity": state.get("activity"),
+        "inventory_count": state.get("inventory_count"),
+        "nearby_creatures": [
+            {
+                "kind": x.get("kind"),
+                "name": x.get("name"),
+                "dx": x.get("dx"),
+                "dy": x.get("dy"),
+                "attitude": x.get("attitude"),
+            }
+            for x in (state.get("nearby_creatures") or [])
+        ],
     }
-    append_life_history(record)
-    append_log(log_path, record)
-    evolution_state["lives_completed"] = int(evolution_state.get("lives_completed", 0)) + 1
-    evolution_state["life_number"] = life_number + 1
-    evolution_state["last_life_end"] = {
-        "wall_time": record["wall_time"],
-        "lifetime_seconds": record["lifetime_seconds"],
-        "last_known_turn": record["last_known_turn"],
-        "last_known_position": record["last_known_position"],
+
+def state_hash(state: dict) -> str:
+    raw = json.dumps(
+        compact_state_for_hash(state), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+def final_state_snapshot(state: dict) -> dict:
+    return {
+        "position": state.get("position"),
+        "turn": state.get("turn"),
+        "hunger": state.get("hunger"),
+        "thirst": state.get("thirst"),
+        "sleepiness": state.get("sleepiness"),
+        "stamina": state.get("stamina"),
+        "stamina_max": state.get("stamina_max"),
+        "health": None,  # not yet exposed by the bridge; preserve schema slot
+        "pain": state.get("pain"),
+        "morale": state.get("morale"),
+        "indoors": state.get("indoors"),
+        "activity": state.get("activity"),
+        "dead": state.get("dead"),
+        "inventory_count": state.get("inventory_count"),
     }
+
+def seconds_between_iso(started_at: str, ended_at: str) -> float | None:
+    try:
+        start = datetime.fromisoformat(started_at)
+        end = datetime.fromisoformat(ended_at)
+        return max(0.0, (end - start).total_seconds())
+    except Exception:
+        return None
+
+@dataclass
+class LifeTelemetry:
+    life_id: str
+    life_number: int
+    started_at: str
+    started_turn: int
+    last_actions: deque = field(default_factory=lambda: deque(maxlen=50))
+    needs_history: list[dict] = field(default_factory=list)
+    hostile_encounters: list[dict] = field(default_factory=list)
+    resources_gained: dict = field(default_factory=lambda: {
+        "items": [],
+        "water_actions": 0,
+        "food_actions": 0,
+    })
+    last_state: dict = field(default_factory=dict)
+    last_needs_sample_action: int = -999999
+    last_hostile_turn: int | None = None
+
+    def observe(self, state: dict, action_count: int, force_sample: bool = False) -> None:
+        self.last_state = final_state_snapshot(state)
+        if force_sample or action_count - self.last_needs_sample_action >= 5:
+            self.needs_history.append({
+                "turn": state.get("turn"),
+                "hunger": state.get("hunger"),
+                "thirst": state.get("thirst"),
+                "stamina": state.get("stamina"),
+                "stamina_max": state.get("stamina_max"),
+                "sleepiness": state.get("sleepiness"),
+            })
+            self.last_needs_sample_action = action_count
+            if len(self.needs_history) > 200:
+                self.needs_history = self.needs_history[-200:]
+
+        hostiles = [
+            x for x in (state.get("nearby_creatures") or [])
+            if str(x.get("attitude", "")).lower() == "hostile"
+        ]
+        if hostiles:
+            turn = int(state.get("turn", 0) or 0)
+            if self.last_hostile_turn != turn:
+                closest = min(
+                    max(abs(int(x.get("dx", 99) or 99)), abs(int(x.get("dy", 99) or 99)))
+                    for x in hostiles
+                )
+                self.hostile_encounters.append({
+                    "turn": turn,
+                    "count": len(hostiles),
+                    "closest_distance": closest,
+                    "outcome": "observed",
+                })
+                self.last_hostile_turn = turn
+                if len(self.hostile_encounters) > 200:
+                    self.hostile_encounters = self.hostile_encounters[-200:]
+
+    def record_action(self, before: dict, after: dict, choice: dict,
+                      outcome: str, verification: dict | None) -> None:
+        self.last_actions.append({
+            "turn": before.get("turn"),
+            "action": choice.get("action"),
+            "params": command_kwargs(choice),
+            "outcome": outcome,
+            "state_before_hash": state_hash(before),
+            "state_after_hash": state_hash(after),
+        })
+        if verification and verification.get("evidence") == "native_pickup_verified":
+            name = verification.get("item_name")
+            if name:
+                self.resources_gained["items"].append(str(name))
+                self.resources_gained["items"] = self.resources_gained["items"][-100:]
+        if verification and verification.get("evidence") == "consume_activity_completed_and_inventory_changed":
+            if verification.get("mode") == "drink" and verification.get("inventory_changed"):
+                self.resources_gained["water_actions"] += 1
+            if verification.get("mode") == "eat" and verification.get("inventory_changed"):
+                self.resources_gained["food_actions"] += 1
+
+    def to_marker(self) -> dict:
+        return {
+            "schema_version": LIFE_RECORD_SCHEMA_VERSION,
+            "life_id": self.life_id,
+            "life_number": self.life_number,
+            "started_at": self.started_at,
+            "started_turn": self.started_turn,
+            "last_actions": list(self.last_actions),
+            "needs_history": self.needs_history,
+            "hostile_encounters": self.hostile_encounters,
+            "resources_gained": self.resources_gained,
+            "last_state": self.last_state,
+            "updated_at": utc_now(),
+        }
+
+    @classmethod
+    def from_marker(cls, marker: dict) -> "LifeTelemetry":
+        life = cls(
+            life_id=str(marker.get("life_id") or uuid.uuid4().hex),
+            life_number=int(marker.get("life_number", 1) or 1),
+            started_at=str(marker.get("started_at") or utc_now()),
+            started_turn=int(marker.get("started_turn", 0) or 0),
+        )
+        life.last_actions = deque(marker.get("last_actions") or [], maxlen=50)
+        life.needs_history = list(marker.get("needs_history") or [])
+        life.hostile_encounters = list(marker.get("hostile_encounters") or [])
+        life.resources_gained = dict(marker.get("resources_gained") or {
+            "items": [], "water_actions": 0, "food_actions": 0
+        })
+        life.last_state = dict(marker.get("last_state") or {})
+        return life
+
+@dataclass
+class LifeRecord:
+    life_id: str
+    life_number: int
+    terminal_state: str
+    started_at: str
+    ended_at: str
+    duration_seconds: float | None
+    duration_game_turns: int | None
+    final_state: dict
+    death_cause: dict | None
+    abort_reason: str | None
+    active_plan_at_end: dict | None
+    last_actions: list[dict]
+    needs_history: list[dict]
+    hostile_encounters: list[dict]
+    resources_gained: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": LIFE_RECORD_SCHEMA_VERSION,
+            "event": "life_terminal",
+            "life_id": self.life_id,
+            "life_number": self.life_number,
+            "terminal_state": self.terminal_state,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_seconds": self.duration_seconds,
+            "duration_game_turns": self.duration_game_turns,
+            "final_state": self.final_state,
+            "death_cause": self.death_cause,
+            "abort_reason": self.abort_reason,
+            "active_plan_at_end": self.active_plan_at_end,
+            "last_actions": self.last_actions,
+            "needs_history": self.needs_history,
+            "hostile_encounters": self.hostile_encounters,
+            "resources_gained": self.resources_gained,
+        }
+
+def write_active_life_marker(life: LifeTelemetry) -> None:
+    write_json_atomic(ACTIVE_LIFE_PATH, life.to_marker())
+
+def clear_active_life_marker() -> None:
+    try:
+        ACTIVE_LIFE_PATH.unlink()
+    except OSError:
+        pass
+
+def ensure_current_life(evolution_state: dict, state: dict) -> LifeTelemetry:
+    life_id = str(evolution_state.get("current_life_id") or uuid.uuid4().hex)
+    started_at = str(evolution_state.get("current_life_started_at") or utc_now())
+    started_turn = int(evolution_state.get("current_life_started_turn", state.get("turn", 0)) or 0)
+    evolution_state["current_life_id"] = life_id
+    evolution_state["current_life_started_at"] = started_at
+    evolution_state["current_life_started_turn"] = started_turn
     save_evolution_state(evolution_state)
+    life = LifeTelemetry(
+        life_id=life_id,
+        life_number=int(evolution_state.get("life_number", 1) or 1),
+        started_at=started_at,
+        started_turn=started_turn,
+    )
+    life.observe(state, 0, force_sample=True)
+    write_active_life_marker(life)
+    return life
+
+def make_life_record(life: LifeTelemetry, terminal_state: str,
+                     final_state: dict, plan: Plan | None,
+                     death_status: dict | None = None,
+                     abort_reason: str | None = None) -> LifeRecord:
+    ended_at = utc_now()
+    final_turn = final_state.get("turn")
+    duration_turns = None
+    try:
+        if final_turn is not None:
+            duration_turns = max(0, int(final_turn) - int(life.started_turn))
+    except Exception:
+        duration_turns = None
+    death_cause = None
+    if terminal_state == "dead":
+        death_cause = {
+            "type": "game_over",
+            "evidence": death_status,
+            "specific_cause": None,
+        }
+    return LifeRecord(
+        life_id=life.life_id,
+        life_number=life.life_number,
+        terminal_state=terminal_state,
+        started_at=life.started_at,
+        ended_at=ended_at,
+        duration_seconds=seconds_between_iso(life.started_at, ended_at),
+        duration_game_turns=duration_turns,
+        final_state=final_state_snapshot(final_state),
+        death_cause=death_cause,
+        abort_reason=abort_reason,
+        active_plan_at_end=plan.to_dict() if plan else None,
+        last_actions=list(life.last_actions),
+        needs_history=list(life.needs_history),
+        hostile_encounters=list(life.hostile_encounters),
+        resources_gained=dict(life.resources_gained),
+    )
+
+def record_life_terminal(evolution_state: dict, life: LifeTelemetry,
+                         terminal_state: str, final_state: dict,
+                         plan: Plan | None, log_path: Path,
+                         death_status: dict | None = None,
+                         abort_reason: str | None = None) -> LifeRecord:
+    life.observe(final_state, len(life.last_actions), force_sample=True)
+    record = make_life_record(
+        life, terminal_state, final_state, plan,
+        death_status=death_status, abort_reason=abort_reason
+    )
+    payload = record.to_dict()
+    append_life_history(payload)
+    append_log(log_path, payload)
+    clear_active_life_marker()
+
+    if terminal_state == "dead":
+        evolution_state["lives_completed"] = int(evolution_state.get("lives_completed", 0)) + 1
+        evolution_state["life_number"] = life.life_number + 1
+        evolution_state["last_consumed_death_signature"] = life_status_signature(death_status)
+        evolution_state["last_life_end"] = {
+            "life_id": life.life_id,
+            "ended_at": record.ended_at,
+            "duration_seconds": record.duration_seconds,
+            "duration_game_turns": record.duration_game_turns,
+            "final_state": record.final_state,
+        }
+        evolution_state.pop("current_life_id", None)
+        evolution_state.pop("current_life_started_at", None)
+        evolution_state.pop("current_life_started_turn", None)
+    save_evolution_state(evolution_state)
+    return record
+
+def recover_previous_runtime(evolution_state: dict, log_path: Path) -> bool:
+    marker = read_json_safe(ACTIVE_LIFE_PATH)
+    status = read_life_status()
+    dead_signature = life_status_signature(status)
+    last_consumed = evolution_state.get("last_consumed_death_signature")
+
+    if status and str(status.get("status", "")) == "dead":
+        if dead_signature and dead_signature == last_consumed:
+            archive_consumed_life_status(status)
+            clear_active_life_marker()
+            return True
+
+        if marker and int(marker.get("schema_version", -1)) == LIFE_RECORD_SCHEMA_VERSION:
+            life = LifeTelemetry.from_marker(marker)
+            final_state = dict(marker.get("last_state") or {})
+        else:
+            life = LifeTelemetry(
+                life_id=str(evolution_state.get("current_life_id") or uuid.uuid4().hex),
+                life_number=int(evolution_state.get("life_number", 1) or 1),
+                started_at=str(evolution_state.get("current_life_started_at") or utc_now()),
+                started_turn=int(evolution_state.get("current_life_started_turn", status.get("turn", 0)) or 0),
+            )
+            final_state = {
+                "turn": status.get("turn"),
+                "position": status.get("position"),
+                "activity": status.get("activity"),
+                "dead": True,
+            }
+
+        record_life_terminal(
+            evolution_state, life, "dead", final_state, None, log_path,
+            death_status=status
+        )
+        archive_consumed_life_status(status)
+        return True
+
+    if marker and int(marker.get("schema_version", -1)) == LIFE_RECORD_SCHEMA_VERSION:
+        life = LifeTelemetry.from_marker(marker)
+        final_state = dict(marker.get("last_state") or {})
+        record_life_terminal(
+            evolution_state, life, "aborted", final_state, None, log_path,
+            abort_reason="previous_runtime_ended_without_death_signal"
+        )
+        clear_active_life_marker()
+
+    return False
 
 def wait_for_manual_respawn() -> dict:
     print()
@@ -1488,7 +1846,7 @@ def wait_for_manual_respawn() -> dict:
     last_notice = 0.0
     while True:
         status = read_life_status()
-        if status and not bool(status.get("dead")):
+        if status and str(status.get("status", "")) == "alive":
             try:
                 obs = send_command("observe", timeout=30.0)
                 state = state_from_response(obs)
@@ -1516,8 +1874,8 @@ def main() -> int:
     wm = WorldModel()
     feed = ThoughtFeed()
     evolution_state = load_evolution_state()
+    must_wait_for_respawn = recover_previous_runtime(evolution_state, log_path)
     life_number = int(evolution_state.get("life_number", 1))
-    life_started_monotonic = time.monotonic()
 
     print("NOVA EVOLUTION — PLANNER + EXECUTOR + LIFE LOOP")
     print(f"Run target: {RUN_MINUTES} minutes")
@@ -1531,11 +1889,24 @@ def main() -> int:
     print("Waiting for a loaded character. You can take your time in the menus...")
 
     try:
-        obs = send_command("observe", timeout=1800.0)
-        state = state_from_response(obs)
-    except LifeEnded:
+        if must_wait_for_respawn:
+            state = wait_for_manual_respawn()
+        else:
+            obs = send_command("observe", timeout=1800.0)
+            state = state_from_response(obs)
+    except LifeEnded as ended:
+        # An unconsumed death raced startup after recovery; preserve it once.
+        temp_life = ensure_current_life(evolution_state, {
+            "turn": ended.status.get("turn"),
+            "position": ended.status.get("position"),
+            "dead": True,
+        })
+        record_life_terminal(
+            evolution_state, temp_life, "dead", temp_life.last_state, None, log_path,
+            death_status=ended.status
+        )
+        archive_consumed_life_status(ended.status)
         state = wait_for_manual_respawn()
-        life_started_monotonic = time.monotonic()
     except Exception as exc:
         print(f"Cannot reach CDDA bridge: {exc}")
         feed.push("ERROR: cannot reach CDDA bridge.")
@@ -1573,6 +1944,8 @@ def main() -> int:
         print("No game action was dispatched in audit mode.")
         return 0
 
+    life = ensure_current_life(evolution_state, state)
+    life_number = life.life_number
     deadline = time.monotonic() + RUN_MINUTES * 60
     action_count = 0
     plan: Plan | None = None
@@ -1708,18 +2081,19 @@ def main() -> int:
             result = send_command(action, timeout=60.0, **command_kwargs(choice))
             command_error = None
         except LifeEnded as ended:
-            record_life_end(
-                evolution_state, life_number, life_started_monotonic,
-                state_before, wm, plan, ended.status, log_path
+            death_record = record_life_terminal(
+                evolution_state, life, "dead", state_before, plan, log_path,
+                death_status=ended.status
             )
-            print(f"LIFE {life_number} ended after {time.monotonic() - life_started_monotonic:.1f}s.")
-            life_number += 1
+            archive_consumed_life_status(ended.status)
+            print(f"LIFE {life.life_number} ended after {death_record.duration_seconds}s.")
             state = wait_for_manual_respawn()
-            life_started_monotonic = time.monotonic()
             wm = WorldModel()
             wm.observe(state)
             plan = None
-            print(f"NOVA LIFE {life_number} STARTED — inherited {len(load_recent_life_history(5))} prior life records.")
+            life = ensure_current_life(evolution_state, state)
+            life_number = life.life_number
+            print(f"NOVA LIFE {life_number} STARTED — prior dead lives recorded: {len(load_recent_life_history(999))}.")
             continue
         except Exception as exc:
             result = None
@@ -1756,18 +2130,19 @@ def main() -> int:
                 state = state_from_response(obs)
             wm.observe(state)
         except LifeEnded as ended:
-            record_life_end(
-                evolution_state, life_number, life_started_monotonic,
-                state_before, wm, plan, ended.status, log_path
+            death_record = record_life_terminal(
+                evolution_state, life, "dead", state_before, plan, log_path,
+                death_status=ended.status
             )
-            print(f"LIFE {life_number} ended after {time.monotonic() - life_started_monotonic:.1f}s.")
-            life_number += 1
+            archive_consumed_life_status(ended.status)
+            print(f"LIFE {life.life_number} ended after {death_record.duration_seconds}s.")
             state = wait_for_manual_respawn()
-            life_started_monotonic = time.monotonic()
             wm = WorldModel()
             wm.observe(state)
             plan = None
-            print(f"NOVA LIFE {life_number} STARTED — inherited {len(load_recent_life_history(5))} prior life records.")
+            life = ensure_current_life(evolution_state, state)
+            life_number = life.life_number
+            print(f"NOVA LIFE {life_number} STARTED — prior dead lives recorded: {len(load_recent_life_history(999))}.")
             continue
         except Exception as exc:
             append_log(log_path, {"wall_time": utc_now(), "observe_error": repr(exc)})
@@ -1801,9 +2176,15 @@ def main() -> int:
             completed_step = None
             plan_event = "step_progress" if progress else "step_failed"
 
+        life.record_action(state_before, state, choice, outcome, verification)
+        life.observe(state, action_count)
+        write_active_life_marker(life)
+
         append_log(log_path, {
             "wall_time": utc_now(),
             "action_index": action_count,
+            "life_id": life.life_id,
+            "life_number": life.life_number,
             "decision_mode": "plan_executor",
             "selected_provenance": choice.get("provenance", "plan_executor"),
             "selected": choice,
@@ -1844,6 +2225,18 @@ def main() -> int:
             plan = None
             wm.active_goal_id = ""
             wm.active_intention = ""
+
+    # A validation window ending is not a death. Record it as aborted/debug
+    # experience and keep the same life number/id for the next runtime attach.
+    try:
+        status = read_life_status()
+        if not status or str(status.get("status", "")) != "dead":
+            record_life_terminal(
+                evolution_state, life, "aborted", state, plan, log_path,
+                abort_reason="validation_window_ended"
+            )
+    except Exception as exc:
+        append_log(log_path, {"wall_time": utc_now(), "abort_record_error": repr(exc)})
 
     feed.push(f"SESSION: finished after {action_count} actions.")
     print()
