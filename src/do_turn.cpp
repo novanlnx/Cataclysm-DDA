@@ -128,6 +128,7 @@ struct ground_consumable_snapshot {
     std::string name;
     int nutrition = 0;
     int quench = 0;
+    bool storable_without_wield = false;
 };
 
 struct local_tile_snapshot {
@@ -238,7 +239,10 @@ static state_snapshot snapshot( avatar &u )
                 tile.items.push_back( it.tname() );
                 if( it.get_comestible() ) {
                     tile.consumables.push_back( {
-                        it.tname(), u.nutrition_for( it ), it.get_comestible()->quench
+                        it.tname(),
+                        u.nutrition_for( it ),
+                        it.get_comestible()->quench,
+                        u.can_add( it, nullptr, false )
                     } );
                 }
                 ++item_count;
@@ -335,6 +339,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
             jsout.member( "name", food.name );
             jsout.member( "nutrition", food.nutrition );
             jsout.member( "quench", food.quench );
+            jsout.member( "storable_without_wield", food.storable_without_wield );
             jsout.end_object();
         }
         jsout.end_array();
@@ -552,6 +557,8 @@ static bool wait_for_turn_action( avatar &u, map &m )
             }
 
             bool obtained = false;
+            bool matched = false;
+            bool safe_storage = false;
             map_cursor cursor( &m, target );
             for( item &it : m.i_at( target ) ) {
                 if( !it.get_comestible() ) {
@@ -560,6 +567,16 @@ static bool wait_for_turn_action( avatar &u, map &m )
                 if( !item_name.empty() && it.tname() != item_name ) {
                     continue;
                 }
+                matched = true;
+
+                // Validation pickup is intentionally narrower than generic CDDA pickup.
+                // It may store the item in an existing pocket, but may NOT silently
+                // wield it, drop something, or open a disposal menu.
+                safe_storage = u.can_add( it, nullptr, false );
+                if( !safe_storage ) {
+                    break;
+                }
+
                 item_location loc( cursor, &it );
                 obtained = static_cast<bool>( loc.obtain( u ) );
                 break;
@@ -568,10 +585,13 @@ static bool wait_for_turn_action( avatar &u, map &m )
             const state_snapshot after = snapshot( u );
             const bool inventory_changed = after.inventory_count > before.inventory_count ||
                                            after.consumables.size() > before.consumables.size();
-            const bool verified = obtained && inventory_changed;
-            write_response( dir, command_id, action, verified,
-                            verified ? "pickup_verified" :
-                            obtained ? "pickup_unverified" : "pickup_failed",
+            const bool verified = obtained && safe_storage && inventory_changed;
+            const std::string pickup_outcome =
+                !matched ? "item_unavailable" :
+                !safe_storage ? "no_safe_storage" :
+                verified ? "pickup_verified" :
+                obtained ? "pickup_unverified" : "pickup_failed";
+            write_response( dir, command_id, action, verified, pickup_outcome,
                             before, after, obtained, false );
             if( obtained ) {
                 return true;
