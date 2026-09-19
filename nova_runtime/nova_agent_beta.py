@@ -557,7 +557,7 @@ def normalize_choice(raw: dict, allowed: list[dict]):
     return None
 
 def qwen_deliberate(model: str, state: dict, wm: WorldModel, actions: list[dict],
-                    replan: bool) -> tuple[list[dict], str]:
+                    replan: bool) -> tuple[list[dict], str, str]:
     world = compact_world(state, wm, actions)
     instruction = (
         "You are Nova, a persistent survivor inhabiting Cataclysm: Dark Days Ahead. "
