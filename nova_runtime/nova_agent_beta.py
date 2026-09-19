@@ -23,9 +23,11 @@ MODEL_AUDIT = os.environ.get("NOVA_MODEL_AUDIT", "").strip().lower() in {"1", "t
 EVOLUTION_STATE_VERSION = 1
 LIFE_RECORD_SCHEMA_VERSION = 1
 LIFE_STATUS_SCHEMA_VERSION = 1
+LESSON_SCHEMA_VERSION = 1
 LIFE_STATUS_PATH = BRIDGE / "life-status.json"
 EVOLUTION_STATE_PATH = STATE_DIR / "nova-evolution-state-v1.json"
 LIFE_HISTORY_PATH = STATE_DIR / "nova-life-history-v1.jsonl"
+LESSON_PATH = STATE_DIR / "nova-lessons-v1.jsonl"
 ACTIVE_LIFE_PATH = STATE_DIR / "nova-active-life-v1.json"
 CONSUMED_LIFE_STATUS_PATH = STATE_DIR / "nova-consumed-life-status-v1.json"
 
@@ -68,6 +70,12 @@ MIN_STORED_KCAL_IMPROVEMENT = 10
 # real CDDA before/after evidence justifies richer appetite logic.
 EAT_NEED_HUNGER = 20
 DRINK_NEED_THIRST = 20
+
+THREAT_RANGE_TILES = 3
+CRITICAL_NEED_THRESHOLD = 80
+STAMINA_LOW_RATIO = 0.35
+LESSON_MATCH_THRESHOLD = 3
+LESSON_ACTION_BIAS = 0.35
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -422,6 +430,8 @@ class WorldModel:
     blocked_edges: set[tuple[int, int, int, int, int, int]] = field(default_factory=set)
     active_goal_id: str = ""
     active_intention: str = ""
+    priority_context: dict = field(default_factory=dict)
+    last_lesson_signature: str = ""
     progress_epoch: int = 0
     no_progress_streak: int = 0
     goal_no_progress: dict[str, int] = field(default_factory=dict)
@@ -705,6 +715,283 @@ def need_profile(state: dict) -> dict:
         "drink_needed": thirst >= DRINK_NEED_THIRST,
     }
 
+def lesson_conditions(state: dict) -> dict:
+    stamina = int(state.get("stamina", 0) or 0)
+    stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+    hostiles = []
+    for creature in state.get("nearby_creatures", []) or []:
+        if str(creature.get("attitude", "")).lower() != "hostile":
+            continue
+        try:
+            distance = max(abs(int(creature.get("dx", 99))), abs(int(creature.get("dy", 99))))
+        except Exception:
+            distance = 99
+        if distance <= THREAT_RANGE_TILES:
+            hostiles.append(creature)
+    return {
+        "indoors": bool(state.get("indoors")),
+        "night": bool(state.get("is_night", False)),
+        "hostile_nearby": bool(hostiles),
+        "stamina_low": stamina / stamina_max < STAMINA_LOW_RATIO,
+        "hunger_critical": int(state.get("hunger", 0) or 0) >= CRITICAL_NEED_THRESHOLD,
+        "thirst_critical": int(state.get("thirst", 0) or 0) >= CRITICAL_NEED_THRESHOLD,
+        "pain_present": int(state.get("pain", 0) or 0) > 0,
+    }
+
+def make_death_lesson(life: "LifeTelemetry", final_state: dict) -> dict | None:
+    if not life.last_actions:
+        return None
+    at_death_action = str(life.last_actions[-1].get("action") or "").strip()
+    if not at_death_action:
+        return None
+    conditions = lesson_conditions(final_state)
+    phrases = []
+    if conditions["hostile_nearby"]:
+        phrases.append("a hostile was within 3 tiles")
+    if conditions["stamina_low"]:
+        phrases.append("stamina was low")
+    if conditions["hunger_critical"]:
+        phrases.append("hunger was critical")
+    if conditions["thirst_critical"]:
+        phrases.append("thirst was critical")
+    if conditions["pain_present"]:
+        phrases.append("Nova was already in pain")
+    phrases.append("Nova was indoors" if conditions["indoors"] else "Nova was outdoors")
+    if conditions["night"]:
+        phrases.append("it was night")
+    context = ", ".join(phrases[:4])
+    return {
+        "schema_version": LESSON_SCHEMA_VERSION,
+        "lesson_id": f"death-{life.life_id}",
+        "source_life_id": life.life_id,
+        "source_life_number": life.life_number,
+        "created_at": utc_now(),
+        "text": f"Life ended while taking {at_death_action}; {context}.",
+        "conditions": conditions,
+        "at_death_action": at_death_action,
+    }
+
+def load_lessons(limit: int = 100) -> list[dict]:
+    if not LESSON_PATH.exists():
+        return []
+    try:
+        lines = LESSON_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    lessons = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        if int(item.get("schema_version", -1)) != LESSON_SCHEMA_VERSION:
+            continue
+        lessons.append(item)
+    return lessons[-max(1, limit):]
+
+def append_lesson(lesson: dict) -> bool:
+    lesson_id = str(lesson.get("lesson_id") or "")
+    if not lesson_id:
+        return False
+    if any(str(item.get("lesson_id")) == lesson_id for item in load_lessons(500)):
+        return False
+    LESSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LESSON_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(lesson, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return True
+
+def lesson_match_count(recorded: dict, current: dict) -> int:
+    # False/false hazard matches are deliberately not counted: otherwise
+    # ordinary safe states would match almost every old death. Indoor/outdoor
+    # is the one neutral context bit that is allowed to count either way.
+    score = 0
+    if "indoors" in recorded and bool(recorded.get("indoors")) == bool(current.get("indoors")):
+        score += 1
+    for key in (
+        "night", "hostile_nearby", "stamina_low",
+        "hunger_critical", "thirst_critical", "pain_present",
+    ):
+        if recorded.get(key) is True and current.get(key) is True:
+            score += 1
+    return score
+
+def apply_lesson_bias(state: dict, actions: list[dict],
+                      lessons: list[dict]) -> tuple[list[dict], list[dict]]:
+    current = lesson_conditions(state)
+    matches = []
+    for lesson in lessons:
+        recorded = lesson.get("conditions") or {}
+        score = lesson_match_count(recorded, current)
+        if score < LESSON_MATCH_THRESHOLD:
+            continue
+        action_name = str(lesson.get("at_death_action") or "")
+        if not action_name or not any(a.get("action") == action_name for a in actions):
+            continue
+        matches.append({
+            "lesson_id": lesson.get("lesson_id"),
+            "text": lesson.get("text"),
+            "at_death_action": action_name,
+            "match_count": score,
+        })
+
+    if not matches:
+        return actions, []
+
+    by_action: dict[str, list[dict]] = {}
+    for match in matches:
+        by_action.setdefault(str(match["at_death_action"]), []).append(match)
+
+    biased = []
+    for action in actions:
+        item = dict(action)
+        action_matches = by_action.get(str(item.get("action")), [])
+        if action_matches:
+            penalty = min(0.65, LESSON_ACTION_BIAS * len(action_matches))
+            item["controller_score"] = max(
+                0.0, float(item.get("controller_score", 0.0)) - penalty
+            )
+            item["lesson_bias"] = {
+                "penalty": round(penalty, 3),
+                "lesson_ids": [m.get("lesson_id") for m in action_matches],
+                "reason": "similar conditions previously ended a life",
+            }
+        biased.append(item)
+    return biased, matches
+
+def hostile_distances(state: dict) -> list[tuple[int, int]]:
+    positions = []
+    for creature in state.get("nearby_creatures", []) or []:
+        if str(creature.get("attitude", "")).lower() != "hostile":
+            continue
+        try:
+            positions.append((int(creature.get("dx", 0)), int(creature.get("dy", 0))))
+        except Exception:
+            continue
+    return positions
+
+def apply_priority_ladder(state: dict, actions: list[dict]) -> tuple[list[dict], dict]:
+    hostiles = hostile_distances(state)
+    nearby = [
+        (dx, dy) for dx, dy in hostiles
+        if max(abs(dx), abs(dy)) <= THREAT_RANGE_TILES
+    ]
+    if nearby:
+        before = min(max(abs(dx), abs(dy)) for dx, dy in nearby)
+        threat_actions = []
+        for action in actions:
+            if action.get("action") != "move_one_tile" or action.get("hostile_on_tile"):
+                continue
+            ax = int(action.get("dx", 0) or 0)
+            ay = int(action.get("dy", 0) or 0)
+            after = min(
+                max(abs(hx - ax), abs(hy - ay))
+                for hx, hy in nearby
+            )
+            if after <= before:
+                continue
+            item = dict(action)
+            item["controller_score"] = min(
+                1.0, float(item.get("controller_score", 0.0)) + 0.25
+            )
+            item["threat_response"] = True
+            item["threat_distance_before"] = before
+            item["threat_distance_after"] = after
+            threat_actions.append(item)
+        if threat_actions:
+            return threat_actions, {
+                "tier": 1,
+                "name": "threat_response",
+                "exclusive": True,
+                "reason": f"hostile within {THREAT_RANGE_TILES} tiles and escape movement exists",
+            }
+
+    hunger = int(state.get("hunger", 0) or 0)
+    thirst = int(state.get("thirst", 0) or 0)
+    critical_actions = []
+    if hunger >= CRITICAL_NEED_THRESHOLD:
+        critical_actions.extend(a for a in actions if a.get("action") == "eat_best_food")
+    if thirst >= CRITICAL_NEED_THRESHOLD:
+        critical_actions.extend(a for a in actions if a.get("action") == "drink_best")
+    if critical_actions:
+        return [dict(a) for a in critical_actions], {
+            "tier": 2,
+            "name": "critical_needs",
+            "exclusive": True,
+            "reason": f"critical need with a real consume action available (hunger={hunger}, thirst={thirst})",
+        }
+
+    boosted = []
+    moderate_need = 20 <= hunger < CRITICAL_NEED_THRESHOLD or 20 <= thirst < CRITICAL_NEED_THRESHOLD
+    hostile_free = not hostiles
+    is_night_now = bool(state.get("is_night", False))
+    indoors_now = bool(state.get("indoors"))
+    shelter_bias_applied = False
+
+    for action in actions:
+        item = dict(action)
+        score = float(item.get("controller_score", 0.0))
+        name = item.get("action")
+
+        if name == "eat_best_food" and 20 <= hunger < CRITICAL_NEED_THRESHOLD:
+            score += 0.20
+            item["priority_boost"] = "moderate_hunger"
+        if name == "drink_best" and 20 <= thirst < CRITICAL_NEED_THRESHOLD:
+            score += 0.20
+            item["priority_boost"] = "moderate_thirst"
+
+        if not indoors_now and is_night_now:
+            if name == "move_one_tile" and bool(item.get("target_indoors", False)):
+                score += 0.28
+                item["shelter_preference"] = "enter_building_at_night"
+                shelter_bias_applied = True
+            elif name == "open_adjacent" and bool(item.get("target_indoors", False)):
+                score += 0.18
+                item["shelter_preference"] = "open_indoor_boundary_at_night"
+                shelter_bias_applied = True
+        elif indoors_now and hostile_free:
+            if name == "move_one_tile":
+                if bool(item.get("target_indoors", False)):
+                    score += 0.12
+                    item["shelter_preference"] = "remain_indoors"
+                    shelter_bias_applied = True
+                else:
+                    score -= 0.18
+                    item["shelter_preference"] = "avoid_leaving_safe_interior"
+
+        if name == "pickup_consumable":
+            score += 0.08
+            item.setdefault("priority_boost", "resource_scouting")
+        elif name == "move_one_tile" and int(item.get("visits_target", 0) or 0) == 0:
+            score += 0.05
+            item.setdefault("priority_boost", "exploration")
+
+        item["controller_score"] = max(0.0, min(1.0, score))
+        boosted.append(item)
+
+    if (not indoors_now and is_night_now) or (indoors_now and hostile_free):
+        return boosted, {
+            "tier": 3,
+            "name": "shelter_seeking",
+            "exclusive": False,
+            "reason": (
+                "outdoors at night: prefer entering shelter"
+                if not indoors_now and is_night_now
+                else "indoors and hostile-free: prefer remaining inside"
+            ),
+            "bias_applied": shelter_bias_applied,
+            "moderate_need_boost": moderate_need,
+        }
+
+    return boosted, {
+        "tier": 4,
+        "name": "default",
+        "exclusive": False,
+        "reason": "resource scouting and exploration fallback",
+        "moderate_need_boost": moderate_need,
+    }
+
 def known_storable_consumables(state: dict, wm: WorldModel | None) -> list[dict]:
     if wm is None:
         return visible_storable_consumables(state)
@@ -742,6 +1029,14 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
     action_names = {a.get("action") for a in actions}
 
     needs = need_profile(state)
+
+    if any(bool(a.get("threat_response")) for a in actions):
+        return [{
+            "goal_id": "evade_threat",
+            "intention": "increase distance from the nearby hostile using a viable escape route",
+            "supported_by": ["move_one_tile"],
+            "priority": 1.0,
+        }]
 
     if "drink_best" in action_names and needs["drink_needed"]:
         candidates.append({
@@ -818,6 +1113,17 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": sorted(action_names),
             "priority": 0.20,
         })
+
+    for candidate in candidates:
+        supported = set(candidate.get("supported_by") or [])
+        penalties = [
+            float((a.get("lesson_bias") or {}).get("penalty", 0.0))
+            for a in actions if a.get("action") in supported and a.get("lesson_bias")
+        ]
+        if penalties:
+            penalty = min(0.35, max(penalties))
+            candidate["priority"] = max(0.0, float(candidate.get("priority", 0.0)) - penalty)
+            candidate["lesson_bias"] = round(penalty, 3)
     return candidates
 
 def choose_fallback_goal(candidates: list[dict]) -> dict:
@@ -860,6 +1166,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             "label": label,
             "controller_score": min(1.0, score),
             "progress": progress,
+            "target_indoors": bool(t.get("indoors", False)),
         })
 
     for name, (dx, dy) in MOVE_DIRECTIONS.items():
@@ -910,6 +1217,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "action": "move_one_tile", "dx": dx, "dy": dy,
                 "label": f"move {name}",
                 "terrain": t.get("terrain", ""),
+                "target_indoors": bool(t.get("indoors", False)),
                 "visits_target": visits,
                 "immediate_backtrack": backtrack,
                 "hostile_on_tile": (dx, dy) in hostiles,
@@ -1027,12 +1335,10 @@ def deterministic_safety(state: dict, actions: list[dict]):
     stamina = int(state.get("stamina", 0) or 0)
     stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
 
-    if thirst > 80 and find("drink_best"):
-        return find("drink_best"), f"urgent thirst ({thirst})"
-    if hunger > 100 and find("eat_best_food"):
-        return find("eat_best_food"), f"urgent hunger ({hunger})"
-    if stamina / stamina_max < 0.25 and find("wait_one_turn"):
-        return find("wait_one_turn"), f"very low stamina ({stamina}/{stamina_max})"
+    if thirst >= CRITICAL_NEED_THRESHOLD and find("drink_best"):
+        return find("drink_best"), f"critical thirst ({thirst})"
+    if hunger >= CRITICAL_NEED_THRESHOLD and find("eat_best_food"):
+        return find("eat_best_food"), f"critical hunger ({hunger})"
     return None
 
 def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
@@ -1045,6 +1351,8 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         )},
         "position": state.get("position"),
         "activity": state.get("activity"),
+        "is_night": bool(state.get("is_night", False)),
+        "priority_ladder": wm.priority_context,
         "active_goal_id": wm.active_goal_id or None,
         "active_intention": wm.active_intention or None,
         "no_progress_streak": wm.no_progress_streak,
@@ -1225,7 +1533,13 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
     intention = str(goal.get("intention", "make grounded progress"))
     steps: list[PlanStep] = []
 
-    if goal_id == "reduce_thirst":
+    if goal_id == "evade_threat":
+        steps.append(PlanStep(
+            kind="explore",
+            params={"max_successful_moves": 1, "successful_moves": 0},
+            completion={"type": "explore_budget"},
+        ))
+    elif goal_id == "reduce_thirst":
         steps.append(PlanStep(
             kind="consume",
             params={"action": "drink_best"},
@@ -1352,6 +1666,8 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
         "Choose WHAT Nova should accomplish next, not which tile to step onto. "
         "The deterministic executor handles movement and ordinary execution. "
         "Choose exactly one goal_id from goal_candidates. "
+        "The priority_ladder has already filtered or biased the action space; respect it. "
+        "When lesson_bias appears, treat it as evidence from a previous real death and prefer a different feasible choice when reasonable. "
         "Use measured needs and feasible affordances only. "
         "Do not invent goals or actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
@@ -1631,6 +1947,8 @@ def final_state_snapshot(state: dict) -> dict:
         "pain": state.get("pain"),
         "morale": state.get("morale"),
         "indoors": state.get("indoors"),
+        "is_night": state.get("is_night"),
+        "hostile_nearby": lesson_conditions(state).get("hostile_nearby"),
         "activity": state.get("activity"),
         "dead": state.get("dead"),
         "inventory_count": state.get("inventory_count"),
@@ -1890,6 +2208,15 @@ def record_life_terminal(evolution_state: dict, life: LifeTelemetry,
     append_log(log_path, payload)
 
     if terminal_state == "dead":
+        lesson = make_death_lesson(life, final_state)
+        if lesson and append_lesson(lesson):
+            append_log(log_path, {
+                "wall_time": utc_now(),
+                "session_event": "lesson_created",
+                "life_id": life.life_id,
+                "life_number": life.life_number,
+                "lesson": lesson,
+            })
         evolution_state["lives_completed"] = int(evolution_state.get("lives_completed", 0)) + 1
         evolution_state["next_life_number"] = life.life_number + 1
         evolution_state["life_number"] = life.life_number + 1
@@ -2075,9 +2402,13 @@ def main() -> int:
         return 4
 
     wm.observe(state)
+    lessons = load_lessons()
 
     if MODEL_AUDIT:
         actions = available_actions(state, wm)
+        actions, priority_context = apply_priority_ladder(state, actions)
+        actions, _ = apply_lesson_bias(state, actions, lessons)
+        wm.priority_context = priority_context
         print()
         print("MODEL AUDIT: sending two real planning requests to Ollama...")
         try:
@@ -2124,8 +2455,33 @@ def main() -> int:
         while time.monotonic() < deadline:
             sit = situation_summary(state, wm)
             actions = available_actions(state, wm)
+            actions, priority_context = apply_priority_ladder(state, actions)
+            actions, matched_lessons = apply_lesson_bias(state, actions, lessons)
+            wm.priority_context = priority_context
             safety = deterministic_safety(state, actions)
-    
+
+            lesson_signature = "|".join(
+                sorted(str(m.get("lesson_id")) for m in matched_lessons if m.get("lesson_id"))
+            )
+            if lesson_signature != wm.last_lesson_signature:
+                wm.last_lesson_signature = lesson_signature
+                if matched_lessons:
+                    first = matched_lessons[0]
+                    memory_line = (
+                        f"MEMORY: biasing away from {first.get('at_death_action')} — "
+                        "similar conditions killed me before."
+                    )
+                    feed.push(memory_line)
+                    append_log(log_path, {
+                        "wall_time": utc_now(),
+                        "session_event": "lesson_fired",
+                        "life_id": life.life_id,
+                        "life_number": life.life_number,
+                        "priority_context": priority_context,
+                        "matches": matched_lessons,
+                        "current_conditions": lesson_conditions(state),
+                    })
+
             feed.push("SEE: " + describe_situation(sit))
     
             if plan and plan.completed:
@@ -2258,6 +2614,7 @@ def main() -> int:
                 )
                 archive_consumed_life_status(ended.status)
                 print(f"LIFE {life.life_number} ended after {death_record.duration_seconds}s.")
+                lessons = load_lessons()
                 state = wait_for_manual_respawn()
                 wm = WorldModel()
                 wm.observe(state)
@@ -2312,6 +2669,7 @@ def main() -> int:
                 )
                 archive_consumed_life_status(ended.status)
                 print(f"LIFE {life.life_number} ended after {death_record.duration_seconds}s.")
+                lessons = load_lessons()
                 state = wait_for_manual_respawn()
                 wm = WorldModel()
                 wm.observe(state)
