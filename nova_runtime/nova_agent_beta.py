@@ -148,6 +148,7 @@ class WorldModel:
     recent_positions: deque = field(default_factory=lambda: deque(maxlen=10))
     recent_actions: deque = field(default_factory=lambda: deque(maxlen=12))
     seen_hostiles: dict[str, dict] = field(default_factory=dict)
+    blocked_edges: set[tuple[int, int, int, int, int, int]] = field(default_factory=set)
     active_intention: str = ""
     intention_age: int = 0
     progress_epoch: int = 0
@@ -177,13 +178,27 @@ class WorldModel:
                 "dx": c.get("dx"), "dy": c.get("dy"),
             }
 
-    def record_action(self, choice: dict, outcome: str) -> None:
+    def edge_key(self, state: dict, dx: int, dy: int) -> tuple[int, int, int, int, int, int]:
+        x, y, z = pos_tuple(state)
+        return (x, y, z, x + dx, y + dy, z)
+
+    def is_known_blocked_edge(self, state: dict, dx: int, dy: int) -> bool:
+        return self.edge_key(state, dx, dy) in self.blocked_edges
+
+    def record_action(self, state_before: dict, choice: dict, outcome: str) -> None:
         self.recent_actions.append({
             "action": choice.get("action"),
             "dx": choice.get("dx"),
             "dy": choice.get("dy"),
             "outcome": outcome,
         })
+        if choice.get("action") == "move_one_tile" and outcome == "blocked":
+            try:
+                self.blocked_edges.add(
+                    self.edge_key(state_before, int(choice.get("dx", 0)), int(choice.get("dy", 0)))
+                )
+            except Exception:
+                pass
         self.intention_age += 1
 
     def visit_count_target(self, state: dict, dx: int, dy: int) -> int:
@@ -318,6 +333,11 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             })
 
         if t.get("passable"):
+            # A native CDDA refusal is evidence.  Do not hammer the same
+            # source->target edge repeatedly just because terrain is nominally passable.
+            if wm.is_known_blocked_edge(state, dx, dy):
+                continue
+
             novelty = 1.0 / (1.0 + visits)
             score = 0.58 + 0.30 * novelty
             if backtrack:
@@ -345,6 +365,10 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
         for food in (t.get("ground_consumables") or [])[:3]:
             name = str(food.get("name", "")).strip()
             if not name:
+                continue
+            if not bool(food.get("storable_without_wield", False)):
+                # This validation action means "store in inventory", not
+                # "wield it because no pocket fits" and never "open a menu".
                 continue
             nutrition = int(food.get("nutrition", 0) or 0)
             quench = int(food.get("quench", 0) or 0)
@@ -663,7 +687,7 @@ def main() -> int:
 
         started = time.monotonic()
         try:
-            result = send_command(action, timeout=900.0, **command_kwargs(choice))
+            result = send_command(action, timeout=60.0, **command_kwargs(choice))
             command_error = None
         except Exception as exc:
             result = None
@@ -695,6 +719,7 @@ def main() -> int:
                 "visited_positions": len(wm.visits),
                 "known_tiles": len(wm.known_tiles),
                 "loop_detected": wm.looping(),
+                "known_blocked_edges": len(wm.blocked_edges),
             },
         }
         append_log(log_path, record)
@@ -704,7 +729,7 @@ def main() -> int:
             break
 
         print(f"[{action_count}] {action}: {outcome} | goal={wm.active_intention!r} | {reason[:90]}")
-        wm.record_action(choice, outcome)
+        wm.record_action(state, choice, outcome)
 
         previous_state = state
         try:
