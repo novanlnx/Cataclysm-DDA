@@ -19,6 +19,11 @@ RUN_MINUTES = int(os.environ.get("NOVA_RUN_MINUTES", "60"))
 MODEL_OVERRIDE = os.environ.get("NOVA_MODEL", "").strip()
 MODEL_AUDIT = os.environ.get("NOVA_MODEL_AUDIT", "").strip().lower() in {"1", "true", "yes", "on"}
 
+EVOLUTION_SCHEMA_VERSION = 1
+LIFE_STATUS_PATH = BRIDGE / "life-status.json"
+EVOLUTION_STATE_PATH = STATE_DIR / "nova-evolution-state-v1.json"
+LIFE_HISTORY_PATH = STATE_DIR / "nova-life-history-v1.jsonl"
+
 CARDINALS = {
     "north": (0, -1),
     "south": (0, 1),
@@ -80,6 +85,64 @@ def write_text_atomic(path: Path, text: str) -> None:
 def write_json_atomic(path: Path, obj: dict) -> None:
     write_text_atomic(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
 
+class LifeEnded(RuntimeError):
+    def __init__(self, status: dict):
+        super().__init__("Nova life ended")
+        self.status = status
+
+def read_json_safe(path: Path) -> dict | None:
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+def read_life_status() -> dict | None:
+    return read_json_safe(LIFE_STATUS_PATH)
+
+def load_evolution_state() -> dict:
+    state = read_json_safe(EVOLUTION_STATE_PATH) or {}
+    if int(state.get("version", -1)) != EVOLUTION_SCHEMA_VERSION:
+        return {
+            "version": EVOLUTION_SCHEMA_VERSION,
+            "life_number": 1,
+            "lives_completed": 0,
+        }
+    state.setdefault("life_number", 1)
+    state.setdefault("lives_completed", 0)
+    return state
+
+def save_evolution_state(state: dict) -> None:
+    payload = dict(state)
+    payload["version"] = EVOLUTION_SCHEMA_VERSION
+    write_json_atomic(EVOLUTION_STATE_PATH, payload)
+
+def append_life_history(record: dict) -> None:
+    LIFE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(record)
+    payload["version"] = EVOLUTION_SCHEMA_VERSION
+    with LIFE_HISTORY_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+def load_recent_life_history(limit: int = 5) -> list[dict]:
+    if not LIFE_HISTORY_PATH.exists():
+        return []
+    try:
+        lines = LIFE_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-max(1, limit):]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and int(item.get("version", -1)) == EVOLUTION_SCHEMA_VERSION:
+            out.append(item)
+    return out
+
 def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
     BRIDGE.mkdir(parents=True, exist_ok=True)
     command_path = BRIDGE / "command.json"
@@ -105,6 +168,9 @@ def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
                 except OSError:
                     pass
                 return data
+        life_status = read_life_status()
+        if life_status and bool(life_status.get("dead")):
+            raise LifeEnded(life_status)
         time.sleep(0.05)
     raise TimeoutError(f"Timed out waiting for CDDA response to {action} ({command_id})")
 
@@ -1136,6 +1202,10 @@ def compact_planner_world(state: dict, wm: WorldModel, actions: list[dict]) -> d
         "controller_executes_steps": True,
         "maximum_plan_steps": 5,
     }
+    # Phase-1 reincarnation memory: raw structured summaries from previous
+    # lives. Reflection/semantic lessons come after the death lifecycle itself
+    # is empirically proven.
+    base["cross_life_history"] = load_recent_life_history(5)
     return base
 
 def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
@@ -1382,6 +1452,58 @@ def append_log(path: Path, record: dict) -> None:
 def command_kwargs(choice: dict) -> dict:
     return {k: choice[k] for k in ("dx", "dy", "item_name", "duration_minutes") if k in choice}
 
+def record_life_end(evolution_state: dict, life_number: int,
+                    life_started_monotonic: float, last_state: dict,
+                    wm: WorldModel, plan: Plan | None,
+                    death_status: dict, log_path: Path) -> None:
+    record = {
+        "event": "life_end",
+        "life_number": life_number,
+        "wall_time": utc_now(),
+        "lifetime_seconds": round(max(0.0, time.monotonic() - life_started_monotonic), 3),
+        "last_known_turn": last_state.get("turn"),
+        "last_known_position": last_state.get("position"),
+        "death_status": death_status,
+        "recent_actions": list(wm.recent_actions)[-12:],
+        "active_plan": plan.to_dict() if plan else None,
+    }
+    append_life_history(record)
+    append_log(log_path, record)
+    evolution_state["lives_completed"] = int(evolution_state.get("lives_completed", 0)) + 1
+    evolution_state["life_number"] = life_number + 1
+    evolution_state["last_life_end"] = {
+        "wall_time": record["wall_time"],
+        "lifetime_seconds": record["lifetime_seconds"],
+        "last_known_turn": record["last_known_turn"],
+        "last_known_position": record["last_known_position"],
+    }
+    save_evolution_state(evolution_state)
+
+def wait_for_manual_respawn() -> dict:
+    print()
+    print("NOVA LIFE ENDED")
+    print("Manual respawn validation: create/load a NEW character in the SAME CDDA world.")
+    print("Nova will wait here and automatically reattach when the new character reaches the map.")
+    print()
+    last_notice = 0.0
+    while True:
+        status = read_life_status()
+        if status and not bool(status.get("dead")):
+            try:
+                obs = send_command("observe", timeout=30.0)
+                state = state_from_response(obs)
+                if not bool(state.get("dead")):
+                    return state
+            except LifeEnded:
+                pass
+            except Exception:
+                pass
+        now = time.monotonic()
+        if now - last_notice >= 15.0:
+            print("...waiting for next living character in the same world")
+            last_notice = now
+        time.sleep(0.25)
+
 def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1393,12 +1515,16 @@ def main() -> int:
     model_trace_path = LOG_DIR / f"nova-model-trace-{stamp}.jsonl"
     wm = WorldModel()
     feed = ThoughtFeed()
+    evolution_state = load_evolution_state()
+    life_number = int(evolution_state.get("life_number", 1))
+    life_started_monotonic = time.monotonic()
 
-    print("NOVA CDDA PLANNER + EXECUTOR VALIDATION")
+    print("NOVA EVOLUTION — PLANNER + EXECUTOR + LIFE LOOP")
     print(f"Run target: {RUN_MINUTES} minutes")
     print(f"Ollama model: {model or 'NOT FOUND - deterministic planner fallback'}")
     print(f"Log: {log_path}")
     print(f"Model trace: {model_trace_path}")
+    print(f"Life: {life_number} | completed lives: {evolution_state.get('lives_completed', 0)}")
     print()
 
     feed.push("NOVA: waiting for a character to enter the world.")
@@ -1406,12 +1532,15 @@ def main() -> int:
 
     try:
         obs = send_command("observe", timeout=1800.0)
+        state = state_from_response(obs)
+    except LifeEnded:
+        state = wait_for_manual_respawn()
+        life_started_monotonic = time.monotonic()
     except Exception as exc:
         print(f"Cannot reach CDDA bridge: {exc}")
         feed.push("ERROR: cannot reach CDDA bridge.")
         return 2
 
-    state = state_from_response(obs)
     wm.observe(state)
 
     if MODEL_AUDIT:
@@ -1578,6 +1707,20 @@ def main() -> int:
         try:
             result = send_command(action, timeout=60.0, **command_kwargs(choice))
             command_error = None
+        except LifeEnded as ended:
+            record_life_end(
+                evolution_state, life_number, life_started_monotonic,
+                state_before, wm, plan, ended.status, log_path
+            )
+            print(f"LIFE {life_number} ended after {time.monotonic() - life_started_monotonic:.1f}s.")
+            life_number += 1
+            state = wait_for_manual_respawn()
+            life_started_monotonic = time.monotonic()
+            wm = WorldModel()
+            wm.observe(state)
+            plan = None
+            print(f"NOVA LIFE {life_number} STARTED — inherited {len(load_recent_life_history(5))} prior life records.")
+            continue
         except Exception as exc:
             result = None
             command_error = repr(exc)
@@ -1612,6 +1755,20 @@ def main() -> int:
                 obs = send_command("observe", timeout=900.0)
                 state = state_from_response(obs)
             wm.observe(state)
+        except LifeEnded as ended:
+            record_life_end(
+                evolution_state, life_number, life_started_monotonic,
+                state_before, wm, plan, ended.status, log_path
+            )
+            print(f"LIFE {life_number} ended after {time.monotonic() - life_started_monotonic:.1f}s.")
+            life_number += 1
+            state = wait_for_manual_respawn()
+            life_started_monotonic = time.monotonic()
+            wm = WorldModel()
+            wm.observe(state)
+            plan = None
+            print(f"NOVA LIFE {life_number} STARTED — inherited {len(load_recent_life_history(5))} prior life records.")
+            continue
         except Exception as exc:
             append_log(log_path, {"wall_time": utc_now(), "observe_error": repr(exc)})
             feed.push("ERROR: lost world observation.")
