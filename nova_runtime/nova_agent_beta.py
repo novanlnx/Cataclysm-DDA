@@ -2483,7 +2483,7 @@ def main() -> int:
     abort_reason = "validation_window_ended"
     transport_failure: dict | None = None
     try:
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             sit = situation_summary(state, wm)
             actions = available_actions(state, wm)
             actions, priority_context = apply_priority_ladder(state, actions)
