@@ -32,6 +32,7 @@
 #endif
 #include "cata_variant.h"
 #include "craft_reservation.h"
+#include "creature_tracker.h"
 #include "clzones.h"
 #include "coordinates.h"
 #include "debug.h"
