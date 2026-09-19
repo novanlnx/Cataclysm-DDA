@@ -128,6 +128,18 @@ def read_json_safe(path: Path) -> dict | None:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+def read_bridge_json_tolerant(path: Path) -> dict | None:
+    """Read a bridge response without letting one bad diagnostic byte hide the protocol event."""
+    try:
+        if not path.exists():
+            return None
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -268,7 +280,7 @@ def send_command(action: str, timeout: float = 180.0, **kwargs) -> dict:
                     return data
 
             if unknown_response_path.exists():
-                unknown = read_json_safe(unknown_response_path)
+                unknown = read_bridge_json_tolerant(unknown_response_path)
                 if unknown and unknown.get("outcome") == "invalid_command":
                     last_invalid_error = str(unknown.get("error") or "invalid_command")
                     try:
@@ -2039,17 +2051,28 @@ def main() -> int:
         archive_consumed_life_status(ended.status)
         state = wait_for_manual_respawn()
     except Exception as exc:
+        # Startup transport failure is not a life event. If an active marker
+        # exists, leave it untouched so a later startup can ask CDDA whether
+        # the same body is still alive and resume the same life_id.
         marker = read_json_safe(ACTIVE_LIFE_PATH)
-        if marker and int(marker.get("schema_version", -1)) == LIFE_RECORD_SCHEMA_VERSION:
-            stale_life = LifeTelemetry.from_marker(marker)
-            stale_state = dict(marker.get("last_state") or {})
-            record_life_terminal(
-                evolution_state, stale_life, "aborted", stale_state, None, log_path,
-                abort_reason=f"startup_observe_failed:{type(exc).__name__}"
-            )
+        append_log(log_path, {
+            "wall_time": utc_now(),
+            "session_event": "transport_failure",
+            "stage": "startup_observe",
+            "error": repr(exc),
+            "life_id": marker.get("life_id") if marker else evolution_state.get("current_life_id"),
+            "life_number": marker.get("life_number") if marker else evolution_state.get("next_life_number"),
+            "terminal_record_written": False,
+            "active_marker_preserved": bool(marker),
+        })
         print(f"Cannot reach CDDA bridge: {exc}")
-        feed.push("ERROR: cannot reach CDDA bridge.")
-        return 2
+        if marker:
+            print(
+                "TRANSPORT FAILURE — existing life identity preserved for recovery: "
+                f"{str(marker.get('life_id', ''))[:8]}"
+            )
+        feed.push("ERROR: cannot reach CDDA bridge; life identity preserved.")
+        return 4
 
     wm.observe(state)
 
