@@ -82,6 +82,11 @@ SHORELINE_TRIGGER_SAMPLES = 12
 SHORELINE_NEAR_DISTANCE = 2
 SHORELINE_ESCAPE_DISTANCE = 7
 SHORELINE_CLEAR_SAMPLES = 6
+SURVIVAL_MISSION = (
+    "Stay alive and improve survival prospects: avoid lethal hazards, "
+    "meet critical needs, secure usable shelter, acquire food/water, "
+    "and explore only when it advances those objectives."
+)
 STRATEGIC_TRAJECTORY_HISTORY = 96
 STRATEGIC_STALL_WINDOW = 64
 STRATEGIC_STALL_MIN_PATH = 40
@@ -442,6 +447,8 @@ class WorldModel:
     blocked_edges: set[tuple[int, int, int, int, int, int]] = field(default_factory=set)
     hazard_tiles: set[tuple[int, int, int]] = field(default_factory=set)
     stall_avoid_tiles: set[tuple[int, int, int]] = field(default_factory=set)
+    known_landmarks: dict[tuple[int, int, int], dict] = field(default_factory=dict)
+    shelter_anchor: tuple[int, int, int] | None = None
     active_goal_id: str = ""
     active_intention: str = ""
     priority_context: dict = field(default_factory=dict)
@@ -488,6 +495,28 @@ class WorldModel:
                     self.hazard_tiles.add(tile_key)
             except Exception:
                 pass
+        for landmark in state.get("strategic_landmarks", []):
+            try:
+                gx = px + int(landmark.get("dx", 0) or 0)
+                gy = py + int(landmark.get("dy", 0) or 0)
+                key = (gx, gy, pz)
+                self.known_landmarks[key] = {
+                    "kind": str(landmark.get("kind", "landmark")),
+                    "terrain": str(landmark.get("terrain", "")),
+                    "first_seen_turn": int(state.get("turn", 0) or 0),
+                }
+            except Exception:
+                pass
+
+        if bool(state.get("indoors")):
+            hostile_close = any(
+                str(critter.get("attitude", "")).lower() == "hostile"
+                and max(abs(int(critter.get("dx", 99) or 99)), abs(int(critter.get("dy", 99) or 99))) <= THREAT_RANGE_TILES
+                for critter in state.get("nearby_creatures", [])
+            )
+            if not hostile_close and self.shelter_anchor is None:
+                self.shelter_anchor = p
+
         water_distance = self.nearest_known_water_distance(p)
         if water_distance is not None:
             self.recent_water_distance.append(water_distance)
@@ -1172,7 +1201,34 @@ def known_structure_targets(state: dict, wm: WorldModel | None) -> list[dict]:
         return []
     px, py, pz = pos_tuple(state)
     targets = []
+    seen = set()
+
+    for (gx, gy, gz), landmark in wm.known_landmarks.items():
+        if gz != pz:
+            continue
+        dx = gx - px
+        dy = gy - py
+        distance = max(abs(dx), abs(dy))
+        if distance <= 1 or distance > 64:
+            continue
+        key = (gx, gy, gz)
+        seen.add(key)
+        targets.append({
+            "gx": gx,
+            "gy": gy,
+            "gz": gz,
+            "dx": dx,
+            "dy": dy,
+            "distance": distance,
+            "terrain": str(landmark.get("terrain", "")),
+            "kind": str(landmark.get("kind", "shelter_interior")),
+            "visited": int(wm.visits.get(key, 0) or 0) > 0,
+            "strategic_landmark": True,
+        })
+
     for (gx, gy, gz), tile in wm.known_tiles.items():
+        if (gx, gy, gz) in seen:
+            continue
         if gz != pz:
             continue
         is_boundary = bool(tile.get("openable"))
@@ -1197,6 +1253,7 @@ def known_structure_targets(state: dict, wm: WorldModel | None) -> list[dict]:
             "terrain": str(tile.get("terrain", "")),
             "kind": "boundary" if is_boundary else "interior",
             "visited": visits > 0,
+            "strategic_landmark": False,
         })
     targets.sort(key=lambda t: (
         0 if t.get("kind") == "boundary" else 1,
@@ -1271,6 +1328,27 @@ def strategic_progress_summary(wm: WorldModel) -> dict:
         "stall_anchor": wm.strategic_stall_anchor,
     }
 
+def mission_phase(state: dict, wm: WorldModel | None) -> str:
+    if wm is None:
+        return "survive"
+    hostile = any(
+        str(c.get("attitude", "")).lower() == "hostile"
+        and max(abs(int(c.get("dx", 99) or 99)), abs(int(c.get("dy", 99) or 99))) <= THREAT_RANGE_TILES
+        for c in state.get("nearby_creatures", [])
+    )
+    if hostile:
+        return "escape_immediate_threat"
+    needs = need_profile(state)
+    if int(needs.get("thirst", 0) or 0) >= CRITICAL_NEED_THRESHOLD:
+        return "solve_critical_thirst"
+    if int(needs.get("hunger", 0) or 0) >= CRITICAL_NEED_THRESHOLD:
+        return "solve_critical_hunger"
+    if bool(state.get("indoors")):
+        return "shelter_secured_maintain_supplies"
+    if known_structure_targets(state, wm):
+        return "reach_known_shelter"
+    return "search_for_shelter"
+
 def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = None) -> list[dict]:
     candidates = []
     action_names = {a.get("action") for a in actions}
@@ -1301,6 +1379,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
         })
     known_resources = known_storable_consumables(state, wm)
     known_structures = known_structure_targets(state, wm)
+    phase = mission_phase(state, wm)
     nonadjacent_resources = [r for r in known_resources if int(r.get("distance", 99)) > 1]
     if nonadjacent_resources and "move_one_tile" in action_names:
         target = max(
@@ -1330,6 +1409,20 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["open_adjacent", "move_one_tile"],
             "priority": 0.76,
         })
+
+    # Mission hierarchy: ordinary exploration is never the top-level purpose.
+    # Outdoors, Nova either moves toward known shelter or searches for shelter.
+    if not bool(state.get("indoors")) and known_structures and "move_one_tile" in action_names:
+        target = known_structures[0]
+        return [{
+            "goal_id": "approach_known_structure",
+            "intention": f"secure shelter by moving toward the spotted {target.get('terrain') or 'structure'}",
+            "supported_by": ["move_one_tile", "open_adjacent"],
+            "priority": 1.0,
+            "target": target,
+            "mission_phase": phase,
+        }]
+
     navigation_judgment = []
     if any(a.get("navigation_override") == "leave_shoreline" for a in actions):
         navigation_judgment.append({
@@ -1372,12 +1465,22 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "priority": 0.94,
         })
     if any(a.get("action") == "move_one_tile" and int(a.get("visits_target", 0) or 0) == 0 for a in actions):
-        candidates.append({
-            "goal_id": "explore_frontier",
-            "intention": "explore nearby unvisited space and update the local map",
-            "supported_by": ["move_one_tile", "open_adjacent"],
-            "priority": 0.72,
-        })
+        if not bool(state.get("indoors")) and not known_structures:
+            candidates.append({
+                "goal_id": "search_for_shelter",
+                "intention": "search deliberately for usable shelter; frontier movement is only the means, not the goal",
+                "supported_by": ["move_one_tile", "open_adjacent"],
+                "priority": 0.82,
+                "mission_phase": phase,
+            })
+        else:
+            candidates.append({
+                "goal_id": "explore_frontier",
+                "intention": "explore nearby unvisited space to improve survival options",
+                "supported_by": ["move_one_tile", "open_adjacent"],
+                "priority": 0.60,
+                "mission_phase": phase,
+            })
     stamina_ratio = float(needs["stamina_ratio"])
     wait_actions = [a for a in actions if a.get("action") == "wait_one_turn"]
     if wait_actions and stamina_ratio < 0.70:
@@ -1698,6 +1801,8 @@ def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> boo
     # stay fast until something appears that can materially change the choice.
     if wm.shoreline_escape_active or wm.strategic_stall_active:
         return True
+    if state.get("strategic_landmarks"):
+        return True
     if wm.looping() or wm.no_progress_streak >= 2:
         return True
     if any(str(c.get("attitude", "")).lower() == "hostile"
@@ -1768,6 +1873,8 @@ def deterministic_safety(state: dict, actions: list[dict]):
 def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
     sit = situation_summary(state, wm)
     return {
+        "mission": SURVIVAL_MISSION,
+        "mission_phase": mission_phase(state, wm),
         "situation": sit,
         "needs": {k: state.get(k) for k in (
             "hunger", "thirst", "sleepiness", "stamina", "stamina_max",
@@ -1868,21 +1975,31 @@ def deterministic_move_toward(step: PlanStep, state: dict, actions: list[dict]) 
     if before <= radius:
         return None
 
-    candidates = []
+    improving = []
+    lateral = []
     for action in actions:
         if action.get("action") != "move_one_tile" or action.get("hostile_on_tile"):
             continue
         dx = int(action.get("dx", 0) or 0)
         dy = int(action.get("dy", 0) or 0)
         after = max(abs(tx - (x + dx)), abs(ty - (y + dy)))
-        if after >= before:
-            continue
-        candidates.append((after, int(action.get("visits_target", 0) or 0),
-                           stable_direction_rank(dx, dy), action))
+        row = (
+            after,
+            int(action.get("visits_target", 0) or 0),
+            1 if action.get("immediate_backtrack") else 0,
+            -float(action.get("controller_score", 0.0)),
+            stable_direction_rank(dx, dy),
+            action,
+        )
+        if after < before:
+            improving.append(row)
+        elif after == before:
+            lateral.append(row)
+    candidates = improving or lateral
     if not candidates:
         return None
-    candidates.sort(key=lambda row: (row[0], row[1], row[2]))
-    choice = dict(candidates[0][3])
+    candidates.sort(key=lambda row: row[:-1])
+    choice = dict(candidates[0][-1])
     choice["reason"] = f"executor step toward committed target ({tx},{ty},{tz})"
     choice["provenance"] = "plan_executor"
     return choice
@@ -2101,6 +2218,12 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
             params={"max_successful_moves": 24, "successful_moves": 0},
             completion={"type": "explore_budget"},
         ))
+    elif goal_id == "search_for_shelter":
+        steps.append(PlanStep(
+            kind="explore",
+            params={"max_successful_moves": 32, "successful_moves": 0},
+            completion={"type": "explore_budget"},
+        ))
     else:
         steps.append(PlanStep(
             kind="explore",
@@ -2136,7 +2259,7 @@ def compact_planner_world(state: dict, wm: WorldModel, actions: list[dict]) -> d
     base.pop("active_goal_id", None)
     base.pop("active_intention", None)
     base["planner_contract"] = {
-        "job": "choose one feasible goal, not a tile-level action",
+        "job": "choose one feasible survival subgoal, not a tile-level action",
         "controller_executes_steps": True,
         "maximum_plan_steps": 5,
     }
@@ -2148,6 +2271,7 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
     world = compact_planner_world(state, wm, actions)
     instruction = (
         "You are Nova's executive planner in Cataclysm: Dark Days Ahead. "
+        f"Permanent mission: {SURVIVAL_MISSION} "
         "Choose WHAT Nova should accomplish next, not which tile to step onto. "
         "The deterministic executor handles movement and ordinary execution. "
         "Choose exactly one goal_id from goal_candidates. "
@@ -2219,6 +2343,12 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
 
     if plan.goal_id == "leave_shoreline" and not wm.shoreline_escape_active:
         return "shoreline_cleared"
+    if plan.goal_id in {"search_for_shelter", "explore_frontier"} and state.get("strategic_landmarks"):
+        return "strategic_landmark_spotted"
+    if plan.goal_id == "approach_known_structure" and any(
+        a.get("action") == "open_adjacent" for a in actions
+    ):
+        return "structure_boundary_reached"
     if plan.goal_id == "break_exploration_stall" and not wm.strategic_stall_active:
         return "strategic_stall_cleared"
 
