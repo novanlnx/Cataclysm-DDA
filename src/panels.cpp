@@ -381,9 +381,24 @@ static void draw_nova_file_panel( const draw_args &args, std::string_view title,
     const int usable_width = std::max( 1, getmaxx( w ) - 2 );
     const int max_rows = std::max( 1, getmaxy( w ) - 2 );
     int row = 1;
-    for( size_t i = 0; i < lines.size() && row <= max_rows; ++i, ++row ) {
-        mvwprintz( w, point( 1, row ), c_light_cyan,
-                   trunc_ellipse( lines[i], static_cast<unsigned int>( usable_width ) ) );
+    for( const std::string &source_line : lines ) {
+        const std::vector<std::string> wrapped = foldstring( source_line, usable_width );
+        if( wrapped.empty() ) {
+            if( row <= max_rows ) {
+                ++row;
+            }
+            continue;
+        }
+        for( const std::string &wrapped_line : wrapped ) {
+            if( row > max_rows ) {
+                break;
+            }
+            mvwprintz( w, point( 1, row ), c_light_cyan, wrapped_line );
+            ++row;
+        }
+        if( row > max_rows ) {
+            break;
+        }
     }
     wnoutrefresh( w );
 }
@@ -446,13 +461,13 @@ static std::vector<window_panel> initialize_default_custom_panels( const widget 
     // current execution state are separate panels so the operator can see why
     // the agent is standing still or changing plans.
     ret.emplace_back( draw_nova_mission, "Nova Mission", to_translation( "Nova Mission" ),
-                      6, width, true );
+                      8, width, true );
     ret.emplace_back( draw_nova_mind, "Nova Mind", to_translation( "Nova Mind" ),
-                      7, width, true );
+                      10, width, true );
     ret.emplace_back( draw_nova_thought_summary, "Nova Thoughts", to_translation( "Nova Thoughts" ),
-                      7, width, true );
+                      11, width, true );
     ret.emplace_back( draw_nova_status, "Nova Status", to_translation( "Nova Status" ),
-                      6, width, true );
+                      8, width, true );
 
     // Add compass, message log, and map to fill remaining space
     // TODO: Make these into proper widgets
