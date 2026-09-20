@@ -398,6 +398,11 @@ static void draw_nova_mind( const draw_args &args )
     draw_nova_file_panel( args, "Nova Mind", "nova-mind.txt" );
 }
 
+static void draw_nova_thought_summary( const draw_args &args )
+{
+    draw_nova_file_panel( args, "Nova Thoughts", "nova-thought-summary.txt" );
+}
+
 static void draw_nova_status( const draw_args &args )
 {
     draw_nova_file_panel( args, "Nova Status", "nova-status.txt" );
@@ -443,6 +448,8 @@ static std::vector<window_panel> initialize_default_custom_panels( const widget 
     ret.emplace_back( draw_nova_mission, "Nova Mission", to_translation( "Nova Mission" ),
                       6, width, true );
     ret.emplace_back( draw_nova_mind, "Nova Mind", to_translation( "Nova Mind" ),
+                      7, width, true );
+    ret.emplace_back( draw_nova_thought_summary, "Nova Thoughts", to_translation( "Nova Thoughts" ),
                       7, width, true );
     ret.emplace_back( draw_nova_status, "Nova Status", to_translation( "Nova Status" ),
                       6, width, true );
