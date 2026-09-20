@@ -442,6 +442,38 @@ def death_suite() -> list[Check]:
                 f"lesson recorded wrong death action: {lesson.get('at_death_action')!r}"
             )
 
+        conditions = lesson.get("conditions") or {}
+        expected_conditions = {
+            "hunger_critical": True,
+            "thirst_critical": True,
+            "indoors": bool(context["state"].get("indoors")),
+        }
+        mismatches = {
+            key: {"expected": expected, "actual": conditions.get(key)}
+            for key, expected in expected_conditions.items()
+            if conditions.get(key) is not expected
+        }
+        if mismatches:
+            raise ValidationFailure(
+                f"lesson conditions are not specific/correct: {mismatches}; full={conditions}"
+            )
+        lesson_text = str(lesson.get("text") or "")
+        expected_text_fragments = [
+            "Life ended while taking wait_one_turn",
+            "hunger was critical",
+            "thirst was critical",
+            "Nova was indoors" if expected_conditions["indoors"] else "Nova was outdoors",
+        ]
+        missing_fragments = [
+            fragment for fragment in expected_text_fragments
+            if fragment not in lesson_text
+        ]
+        if missing_fragments:
+            raise ValidationFailure(
+                "lesson text is too vague or missing expected evidence; "
+                f"missing={missing_fragments}, lesson={lesson_text!r}"
+            )
+
         evolved = agent.load_evolution_state()
         if int(evolved.get("lives_completed", 0) or 0) != 1:
             raise ValidationFailure(f"lives_completed is not 1: {evolved}")
@@ -452,8 +484,8 @@ def death_suite() -> list[Check]:
         context["lesson"] = lesson
         context["evolved"] = evolved
         return (
-            f"death produced exactly one lesson {lesson.get('lesson_id')} and "
-            "advanced evolution state to Life 2"
+            f"death produced exactly one specific lesson {lesson.get('lesson_id')}: "
+            f"{lesson_text} | advanced evolution state to Life 2"
         )
 
     add_check(checks, "death -> terminal record -> lesson", process_death_to_lesson)
@@ -545,13 +577,30 @@ def death_suite() -> list[Check]:
         status_text = (agent.BRIDGE / "nova-status.txt").read_text(
             encoding="utf-8", errors="replace"
         )
-        if "MEMORY: biasing away from wait_one_turn" not in thought_text:
+        expected_memory_fragments = [
+            lesson_id,
+            "wait_one_turn",
+            "critical hunger",
+            "critical thirst",
+            "indoors" if bool(next_state.get("indoors")) else "outdoors",
+        ]
+        missing_thought = [
+            fragment for fragment in expected_memory_fragments
+            if fragment not in thought_text
+        ]
+        missing_status = [
+            fragment for fragment in expected_memory_fragments
+            if fragment not in status_text
+        ]
+        if missing_thought:
             raise ValidationFailure(
-                "visible thought feed did not show the inherited memory signal"
+                "visible thought feed fired MEMORY but did not show specific inherited "
+                f"lesson content; missing={missing_thought}; text={thought_text!r}"
             )
-        if lesson_id not in status_text:
+        if missing_status:
             raise ValidationFailure(
-                "Nova Status MEMORY line did not display the inherited lesson id"
+                "Nova Status MEMORY line did not show specific inherited lesson "
+                f"content; missing={missing_status}; text={status_text!r}"
             )
 
         log_lines = log_path.read_text(encoding="utf-8").splitlines()
@@ -569,7 +618,7 @@ def death_suite() -> list[Check]:
         return (
             f"Life 2 ({life2.life_id[:8]}) inherited {lesson_id}, action score "
             f"{candidate_actions[0]['controller_score']:.2f}->{float(biased[0]['controller_score']):.2f}, "
-            "and visible MEMORY/log signals fired"
+            "and visible MEMORY/log signals showed the specific inherited conditions"
         )
 
     add_check(
