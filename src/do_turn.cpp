@@ -151,6 +151,14 @@ struct local_tile_snapshot {
     std::vector<ground_consumable_snapshot> consumables;
 };
 
+struct strategic_landmark_snapshot {
+    std::string kind;
+    std::string terrain;
+    int dx = 0;
+    int dy = 0;
+    int distance = 0;
+};
+
 struct creature_snapshot {
     std::string kind;
     std::string name;
@@ -185,6 +193,7 @@ struct state_snapshot {
     bool dead = false;
     std::string activity;
     std::vector<local_tile_snapshot> local_tiles;
+    std::vector<strategic_landmark_snapshot> strategic_landmarks;
     std::vector<creature_snapshot> creatures;
     std::vector<consumable_snapshot> consumables;
     int inventory_count = 0;
@@ -271,6 +280,60 @@ static state_snapshot snapshot( avatar &u )
                 ++item_count;
             }
             state.local_tiles.push_back( std::move( tile ) );
+        }
+    }
+
+    // Strategic perception: the 5x5 local tiles are sufficient for footsteps,
+    // but not for choosing a destination. Expose a lightweight wider-radius
+    // set of shelter-like landmarks without dumping the whole reality bubble.
+    // These are observations only; movement remains one native tile at a time.
+    constexpr int strategic_radius = 24;
+    std::vector<strategic_landmark_snapshot> landmark_candidates;
+    for( int dy = -strategic_radius; dy <= strategic_radius; ++dy ) {
+        for( int dx = -strategic_radius; dx <= strategic_radius; ++dx ) {
+            if( std::max( std::abs( dx ), std::abs( dy ) ) <= 2 ) {
+                continue;
+            }
+            const tripoint_bub_ms p = pos + tripoint_rel_ms( dx, dy, 0 );
+            if( !m.inbounds( p ) ) {
+                continue;
+            }
+            if( !m.is_outside( p ) && m.passable( p ) ) {
+                landmark_candidates.push_back( {
+                    "shelter_interior",
+                    m.name( p ),
+                    dx,
+                    dy,
+                    std::max( std::abs( dx ), std::abs( dy ) )
+                } );
+            }
+        }
+    }
+    std::sort( landmark_candidates.begin(), landmark_candidates.end(),
+    []( const strategic_landmark_snapshot &lhs, const strategic_landmark_snapshot &rhs ) {
+        if( lhs.distance != rhs.distance ) {
+            return lhs.distance < rhs.distance;
+        }
+        if( lhs.dy != rhs.dy ) {
+            return lhs.dy < rhs.dy;
+        }
+        return lhs.dx < rhs.dx;
+    } );
+    for( const strategic_landmark_snapshot &candidate : landmark_candidates ) {
+        bool same_cluster = false;
+        for( const strategic_landmark_snapshot &kept : state.strategic_landmarks ) {
+            if( std::max( std::abs( candidate.dx - kept.dx ),
+                          std::abs( candidate.dy - kept.dy ) ) <= 5 ) {
+                same_cluster = true;
+                break;
+            }
+        }
+        if( same_cluster ) {
+            continue;
+        }
+        state.strategic_landmarks.push_back( candidate );
+        if( state.strategic_landmarks.size() >= 12 ) {
+            break;
         }
     }
 
@@ -375,6 +438,19 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
             jsout.end_object();
         }
         jsout.end_array();
+        jsout.end_object();
+    }
+    jsout.end_array();
+
+    jsout.member( "strategic_landmarks" );
+    jsout.start_array();
+    for( const strategic_landmark_snapshot &landmark : state.strategic_landmarks ) {
+        jsout.start_object();
+        jsout.member( "kind", landmark.kind );
+        jsout.member( "terrain", landmark.terrain );
+        jsout.member( "dx", landmark.dx );
+        jsout.member( "dy", landmark.dy );
+        jsout.member( "distance", landmark.distance );
         jsout.end_object();
     }
     jsout.end_array();
