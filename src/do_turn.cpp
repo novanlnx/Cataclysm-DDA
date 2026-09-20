@@ -180,6 +180,27 @@ struct consumable_snapshot {
     int quench = 0;
 };
 
+struct inventory_item_snapshot {
+    std::string name;
+    std::string type_id;
+    bool wielded = false;
+    bool worn = false;
+    bool consumable = false;
+    bool armor = false;
+    bool gun = false;
+    bool melee = false;
+    bool tool = false;
+    bool container = false;
+    bool usable = false;
+    bool can_wield = false;
+    bool can_wear = false;
+    int weight_grams = 0;
+    int volume_ml = 0;
+    int charges = 0;
+    int count = 1;
+    int ammo_remaining = 0;
+};
+
 struct state_snapshot {
     int turn = 0;
     int x = 0;
@@ -203,6 +224,7 @@ struct state_snapshot {
     std::vector<strategic_landmark_snapshot> strategic_landmarks;
     std::vector<creature_snapshot> creatures;
     std::vector<consumable_snapshot> consumables;
+    std::vector<inventory_item_snapshot> inventory_items;
     int inventory_count = 0;
 };
 
@@ -402,7 +424,35 @@ static state_snapshot snapshot( avatar &u )
             loc->get_comestible()->quench
         } );
     }
-    state.inventory_count = static_cast<int>( u.all_items_loc().size() );
+    const std::vector<item_location> all_items = u.all_items_loc();
+    state.inventory_count = static_cast<int>( all_items.size() );
+    int exposed_items = 0;
+    for( const item_location &loc : all_items ) {
+        if( !loc || exposed_items >= 80 ) {
+            continue;
+        }
+        inventory_item_snapshot inv_item;
+        inv_item.name = loc->tname();
+        inv_item.type_id = loc->typeId().str();
+        inv_item.wielded = u.is_wielding( *loc );
+        inv_item.worn = u.is_worn( *loc );
+        inv_item.consumable = static_cast<bool>( loc->get_comestible() );
+        inv_item.armor = loc->is_armor();
+        inv_item.gun = loc->is_gun();
+        inv_item.melee = loc->is_melee();
+        inv_item.tool = loc->is_tool();
+        inv_item.container = loc->is_container();
+        inv_item.usable = loc->item_has_uses_recursive();
+        inv_item.can_wield = u.can_wield( *loc ).success();
+        inv_item.can_wear = inv_item.armor && !inv_item.worn && u.can_wear( *loc ).success();
+        inv_item.weight_grams = static_cast<int>( units::to_gram( loc->weight() ) );
+        inv_item.volume_ml = static_cast<int>( units::to_milliliter( loc->volume() ) );
+        inv_item.charges = loc->charges;
+        inv_item.count = loc->count();
+        inv_item.ammo_remaining = inv_item.gun ? loc->ammo_remaining( &u ) : 0;
+        state.inventory_items.push_back( std::move( inv_item ) );
+        ++exposed_items;
+    }
 
     return state;
 }
@@ -507,6 +557,31 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.end_array();
 
     jsout.member( "inventory_count", state.inventory_count );
+    jsout.member( "inventory_items" );
+    jsout.start_array();
+    for( const inventory_item_snapshot &inv_item : state.inventory_items ) {
+        jsout.start_object();
+        jsout.member( "name", inv_item.name );
+        jsout.member( "type_id", inv_item.type_id );
+        jsout.member( "wielded", inv_item.wielded );
+        jsout.member( "worn", inv_item.worn );
+        jsout.member( "consumable", inv_item.consumable );
+        jsout.member( "armor", inv_item.armor );
+        jsout.member( "gun", inv_item.gun );
+        jsout.member( "melee", inv_item.melee );
+        jsout.member( "tool", inv_item.tool );
+        jsout.member( "container", inv_item.container );
+        jsout.member( "usable", inv_item.usable );
+        jsout.member( "can_wield", inv_item.can_wield );
+        jsout.member( "can_wear", inv_item.can_wear );
+        jsout.member( "weight_grams", inv_item.weight_grams );
+        jsout.member( "volume_ml", inv_item.volume_ml );
+        jsout.member( "charges", inv_item.charges );
+        jsout.member( "count", inv_item.count );
+        jsout.member( "ammo_remaining", inv_item.ammo_remaining );
+        jsout.end_object();
+    }
+    jsout.end_array();
     jsout.member( "inventory_consumables" );
     jsout.start_array();
     for( const consumable_snapshot &food : state.consumables ) {
@@ -606,6 +681,24 @@ static bool valid_delta( int dx, int dy )
     return dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1 && !( dx == 0 && dy == 0 );
 }
 
+static item_location find_carried_item( avatar &u, const std::string &item_name,
+                                        const std::string &item_type_id )
+{
+    for( item_location &loc : u.all_items_loc() ) {
+        if( !loc ) {
+            continue;
+        }
+        if( !item_type_id.empty() && loc->typeId().str() != item_type_id ) {
+            continue;
+        }
+        if( !item_name.empty() && loc->tname() != item_name ) {
+            continue;
+        }
+        return loc;
+    }
+    return item_location();
+}
+
 static item_location best_consumable( avatar &u, bool drink )
 {
     std::vector<item_location> options = u.cache_get_items_with( "is_food", &item::is_food );
@@ -668,6 +761,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
         int dy = 0;
         int duration_minutes = 480;
         std::string item_name;
+        std::string item_type_id;
         try {
             std::ifstream fin( command );
             TextJsonIn jsin( fin );
@@ -678,6 +772,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
             dy = jo.get_int( "dy", 0 );
             duration_minutes = jo.get_int( "duration_minutes", 480 );
             item_name = jo.get_string( "item_name", "" );
+            item_type_id = jo.get_string( "item_type_id", "" );
         } catch( const std::exception &err ) {
             const state_snapshot current = snapshot( u );
             fs::remove( command, ec );
@@ -709,6 +804,97 @@ static bool wait_for_turn_action( avatar &u, map &m )
             write_response( dir, command_id, action, true, "waited",
                             before, after, true, false );
             return true;
+        }
+
+        if( action == "close_adjacent" ) {
+            if( !valid_delta( dx, dy ) ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false );
+                continue;
+            }
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            const bool inside = !m.is_outside( u.pos_bub() );
+            if( !m.inbounds( target ) || !m.close_door( target, inside, true ) ) {
+                write_response( dir, command_id, action, false, "not_closable",
+                                before, before, false, false );
+                continue;
+            }
+            const bool closed = m.close_door( target, inside, false );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, closed,
+                            closed ? "closed" : "close_failed",
+                            before, after, closed, false );
+            if( closed ) {
+                return true;
+            }
+            continue;
+        }
+
+        if( action == "wield_item" ) {
+            item_location loc = find_carried_item( u, item_name, item_type_id );
+            if( !loc ) {
+                write_response( dir, command_id, action, false, "item_unavailable",
+                                before, before, false, false );
+                continue;
+            }
+            if( u.is_wielding( *loc ) ) {
+                write_response( dir, command_id, action, true, "already_wielded",
+                                before, before, false, false );
+                continue;
+            }
+            if( u.get_wielded_item() ) {
+                write_response( dir, command_id, action, false, "hands_occupied",
+                                before, before, false, false,
+                                "Nova safe wield does not auto-dispose the current weapon" );
+                continue;
+            }
+            if( !u.can_wield( *loc ).success() ) {
+                write_response( dir, command_id, action, false, "cannot_wield",
+                                before, before, false, false );
+                continue;
+            }
+            const std::string expected_type = loc->typeId().str();
+            const bool wielded = u.wield( loc, true );
+            const state_snapshot after = snapshot( u );
+            const item_location current = u.get_wielded_item();
+            const bool verified = wielded && current && current->typeId().str() == expected_type;
+            write_response( dir, command_id, action, verified,
+                            verified ? "wield_verified" : "wield_failed",
+                            before, after, wielded, false );
+            if( wielded ) {
+                return true;
+            }
+            continue;
+        }
+
+        if( action == "wear_item" ) {
+            item_location loc = find_carried_item( u, item_name, item_type_id );
+            if( !loc ) {
+                write_response( dir, command_id, action, false, "item_unavailable",
+                                before, before, false, false );
+                continue;
+            }
+            if( u.is_worn( *loc ) ) {
+                write_response( dir, command_id, action, true, "already_worn",
+                                before, before, false, false );
+                continue;
+            }
+            if( !loc->is_armor() || !u.can_wear( *loc ).success() ) {
+                write_response( dir, command_id, action, false, "cannot_wear",
+                                before, before, false, false );
+                continue;
+            }
+            const std::string expected_type = loc->typeId().str();
+            const auto worn_result = u.wear( loc, false );
+            const state_snapshot after = snapshot( u );
+            const bool verified = worn_result.has_value() && u.is_wearing( itype_id( expected_type ) );
+            write_response( dir, command_id, action, verified,
+                            verified ? "wear_verified" : "wear_failed",
+                            before, after, worn_result.has_value(), false );
+            if( worn_result.has_value() ) {
+                return true;
+            }
+            continue;
         }
 
         if( action == "sleep" ) {
@@ -893,7 +1079,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
 
         write_response( dir, command_id, action, false, "unsupported_action",
                         before, before, false, false,
-                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, pickup_consumable, pickup_item, eat_best_food, drink_best, sleep, quicksave" );
+                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, close_adjacent, pickup_consumable, pickup_item, wield_item, wear_item, eat_best_food, drink_best, sleep, quicksave" );
     }
 }
 
