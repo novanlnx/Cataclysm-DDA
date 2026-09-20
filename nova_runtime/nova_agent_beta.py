@@ -1178,13 +1178,13 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "priority": 0.76,
         })
     if any(a.get("navigation_override") == "leave_shoreline" for a in actions):
-        candidates.append({
+        return [{
             "goal_id": "leave_shoreline",
             "intention": "move inland because recent exploration has stayed too close to the shoreline",
             "supported_by": ["move_one_tile"],
-            "priority": 0.99,
+            "priority": 1.0,
             "navigation_override": True,
-        })
+        }]
     if any(a.get("stall_escape") for a in actions):
         candidates.append({
             "goal_id": "escape_local_stall",
