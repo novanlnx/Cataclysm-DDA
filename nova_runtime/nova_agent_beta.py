@@ -82,6 +82,12 @@ SHORELINE_TRIGGER_SAMPLES = 12
 SHORELINE_NEAR_DISTANCE = 2
 SHORELINE_ESCAPE_DISTANCE = 7
 SHORELINE_CLEAR_SAMPLES = 6
+STRATEGIC_TRAJECTORY_HISTORY = 96
+STRATEGIC_STALL_WINDOW = 64
+STRATEGIC_STALL_MIN_PATH = 40
+STRATEGIC_STALL_MAX_NET = 14
+STRATEGIC_STALL_MAX_EFFICIENCY = 0.28
+STRATEGIC_STALL_CLEAR_DISTANCE = 18
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -446,11 +452,15 @@ class WorldModel:
     recent_water_distance: deque = field(default_factory=lambda: deque(maxlen=SHORELINE_HISTORY))
     shoreline_escape_active: bool = False
     shoreline_clear_streak: int = 0
+    trajectory_positions: deque = field(default_factory=lambda: deque(maxlen=STRATEGIC_TRAJECTORY_HISTORY))
+    strategic_stall_active: bool = False
+    strategic_stall_anchor: tuple[int, int, int] | None = None
 
     def observe(self, state: dict) -> None:
         p = pos_tuple(state)
         self.visits[p] = self.visits.get(p, 0) + 1
         self.recent_positions.append(p)
+        self.trajectory_positions.append(p)
         px, py, pz = p
         for t in state.get("local_tiles", []):
             try:
@@ -500,6 +510,44 @@ class WorldModel:
                     self.shoreline_escape_active = False
                     self.shoreline_clear_streak = 0
                     self.recent_water_distance.clear()
+
+        # Strategic stall detection is intentionally different from the local
+        # blocked-edge/no-progress detector. Successful footsteps can still be
+        # strategically useless if a long path folds back onto itself.
+        trajectory = list(self.trajectory_positions)
+        if not self.strategic_stall_active and len(trajectory) >= STRATEGIC_STALL_WINDOW:
+            window = trajectory[-STRATEGIC_STALL_WINDOW:]
+            path_distance = 0
+            for a, b in zip(window, window[1:]):
+                if a[2] != b[2]:
+                    continue
+                path_distance += max(abs(b[0] - a[0]), abs(b[1] - a[1]))
+            start = window[0]
+            end = window[-1]
+            net_distance = (
+                max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+                if end[2] == start[2] else path_distance
+            )
+            efficiency = (net_distance / path_distance) if path_distance > 0 else 1.0
+            if (
+                path_distance >= STRATEGIC_STALL_MIN_PATH
+                and (
+                    net_distance <= STRATEGIC_STALL_MAX_NET
+                    or efficiency <= STRATEGIC_STALL_MAX_EFFICIENCY
+                )
+            ):
+                self.strategic_stall_active = True
+                self.strategic_stall_anchor = p
+                self.trajectory_positions.clear()
+                self.trajectory_positions.append(p)
+
+        if self.strategic_stall_active and self.strategic_stall_anchor is not None:
+            ax, ay, az = self.strategic_stall_anchor
+            if pz == az and max(abs(px - ax), abs(py - ay)) >= STRATEGIC_STALL_CLEAR_DISTANCE:
+                self.strategic_stall_active = False
+                self.strategic_stall_anchor = None
+                self.trajectory_positions.clear()
+                self.trajectory_positions.append(p)
 
         for c in state.get("nearby_creatures", []):
             name = str(c.get("name", "creature"))
@@ -1119,6 +1167,110 @@ def known_storable_consumables(state: dict, wm: WorldModel | None) -> list[dict]
             })
     return found
 
+def known_structure_targets(state: dict, wm: WorldModel | None) -> list[dict]:
+    if wm is None:
+        return []
+    px, py, pz = pos_tuple(state)
+    targets = []
+    for (gx, gy, gz), tile in wm.known_tiles.items():
+        if gz != pz:
+            continue
+        is_boundary = bool(tile.get("openable"))
+        is_interior = bool(tile.get("indoors")) and bool(tile.get("passable"))
+        if not (is_boundary or is_interior):
+            continue
+        visits = int(wm.visits.get((gx, gy, gz), 0) or 0)
+        if visits > 0 and is_interior:
+            continue
+        dx = gx - px
+        dy = gy - py
+        distance = max(abs(dx), abs(dy))
+        if distance <= 1 or distance > 64:
+            continue
+        targets.append({
+            "gx": gx,
+            "gy": gy,
+            "gz": gz,
+            "dx": dx,
+            "dy": dy,
+            "distance": distance,
+            "terrain": str(tile.get("terrain", "")),
+            "kind": "boundary" if is_boundary else "interior",
+            "visited": visits > 0,
+        })
+    targets.sort(key=lambda t: (
+        0 if t.get("kind") == "boundary" else 1,
+        1 if t.get("visited") else 0,
+        int(t.get("distance", 999)),
+    ))
+    return targets
+
+def known_escape_target(state: dict, wm: WorldModel | None) -> dict | None:
+    if wm is None:
+        return None
+    px, py, pz = pos_tuple(state)
+    candidates = []
+    for (gx, gy, gz), tile in wm.known_tiles.items():
+        if gz != pz or not bool(tile.get("passable")):
+            continue
+        if (
+            bool(tile.get("movement_hazard"))
+            or bool(tile.get("dangerous"))
+            or bool(tile.get("deep_water"))
+            or bool(tile.get("swimmable"))
+        ):
+            continue
+        distance = max(abs(gx - px), abs(gy - py))
+        if distance < 6 or distance > 28:
+            continue
+        visits = int(wm.visits.get((gx, gy, gz), 0) or 0)
+        recent_penalty = 1 if (gx, gy, gz) in set(wm.trajectory_positions) else 0
+        candidates.append((
+            visits,
+            recent_penalty,
+            -distance,
+            {
+                "gx": gx,
+                "gy": gy,
+                "gz": gz,
+                "distance": distance,
+                "terrain": str(tile.get("terrain", "")),
+            },
+        ))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1], row[2]))
+    return candidates[0][3]
+
+def strategic_progress_summary(wm: WorldModel) -> dict:
+    trajectory = list(wm.trajectory_positions)
+    if len(trajectory) < 2:
+        return {
+            "samples": len(trajectory),
+            "path_distance": 0,
+            "net_displacement": 0,
+            "efficiency": 1.0,
+            "stall_active": wm.strategic_stall_active,
+        }
+    path_distance = 0
+    for a, b in zip(trajectory, trajectory[1:]):
+        if a[2] == b[2]:
+            path_distance += max(abs(b[0] - a[0]), abs(b[1] - a[1]))
+    start = trajectory[0]
+    end = trajectory[-1]
+    net = (
+        max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+        if start[2] == end[2] else path_distance
+    )
+    return {
+        "samples": len(trajectory),
+        "path_distance": path_distance,
+        "net_displacement": net,
+        "efficiency": round(net / path_distance, 3) if path_distance else 1.0,
+        "stall_active": wm.strategic_stall_active,
+        "stall_anchor": wm.strategic_stall_anchor,
+    }
+
 def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = None) -> list[dict]:
     candidates = []
     action_names = {a.get("action") for a in actions}
@@ -1148,6 +1300,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "priority": 0.96,
         })
     known_resources = known_storable_consumables(state, wm)
+    known_structures = known_structure_targets(state, wm)
     nonadjacent_resources = [r for r in known_resources if int(r.get("distance", 99)) > 1]
     if nonadjacent_resources and "move_one_tile" in action_names:
         target = max(
@@ -1177,14 +1330,40 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["open_adjacent", "move_one_tile"],
             "priority": 0.76,
         })
+    navigation_judgment = []
     if any(a.get("navigation_override") == "leave_shoreline" for a in actions):
-        return [{
+        navigation_judgment.append({
             "goal_id": "leave_shoreline",
             "intention": "move inland because recent exploration has stayed too close to the shoreline",
             "supported_by": ["move_one_tile"],
-            "priority": 1.0,
+            "priority": 0.97,
             "navigation_override": True,
-        }]
+        })
+
+    if known_structures and "move_one_tile" in action_names:
+        target = known_structures[0]
+        navigation_judgment.append({
+            "goal_id": "approach_known_structure",
+            "intention": f"move toward a previously spotted {target.get('terrain') or 'structure'} instead of continuing blind frontier walking",
+            "supported_by": ["move_one_tile", "open_adjacent"],
+            "priority": 0.99 if (wm and (wm.strategic_stall_active or wm.shoreline_escape_active)) else 0.84,
+            "target": target,
+        })
+
+    if wm and wm.strategic_stall_active and "move_one_tile" in action_names:
+        escape_target = known_escape_target(state, wm)
+        navigation_judgment.append({
+            "goal_id": "break_exploration_stall",
+            "intention": "break the long low-displacement exploration pattern and commit to a different heading",
+            "supported_by": ["move_one_tile"],
+            "priority": 0.95,
+            "target": escape_target,
+            "strategic_stall": strategic_progress_summary(wm),
+        })
+
+    if wm and (wm.strategic_stall_active or wm.shoreline_escape_active) and navigation_judgment:
+        return navigation_judgment
+
     if any(a.get("stall_escape") for a in actions):
         candidates.append({
             "goal_id": "escape_local_stall",
@@ -1517,7 +1696,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> bool:
     # Qwen is for judgment, not footsteps. Empty, repetitive traversal should
     # stay fast until something appears that can materially change the choice.
-    if wm.shoreline_escape_active:
+    if wm.shoreline_escape_active or wm.strategic_stall_active:
         return True
     if wm.looping() or wm.no_progress_streak >= 2:
         return True
@@ -1607,6 +1786,8 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
             "current_water_distance": wm.nearest_known_water_distance(pos_tuple(state)),
             "clear_distance": SHORELINE_ESCAPE_DISTANCE,
         },
+        "strategic_progress": strategic_progress_summary(wm),
+        "known_structure_targets": known_structure_targets(state, wm)[:5],
         "active_goal_no_progress": wm.goal_no_progress.get(wm.active_goal_id, 0),
         "goal_candidates": goal_candidates(state, actions, wm),
         "allowed_actions": actions,
@@ -1803,6 +1984,46 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
             params={"action": "eat_best_food"},
             completion={"type": "consumed"},
         ))
+    elif goal_id == "approach_known_structure":
+        target = dict(goal.get("target") or {})
+        if target:
+            abs_target = {
+                "x": int(target.get("gx", pos_tuple(state)[0])),
+                "y": int(target.get("gy", pos_tuple(state)[1])),
+                "z": int(target.get("gz", pos_tuple(state)[2])),
+            }
+            steps.append(PlanStep(
+                kind="go_to",
+                target=abs_target,
+                params={"arrival_radius": 1},
+                completion={"type": "arrived_near"},
+            ))
+            if target.get("kind") == "boundary":
+                steps.append(PlanStep(
+                    kind="interact",
+                    target=abs_target,
+                    params={"action": "open_adjacent"},
+                    completion={"type": "opened"},
+                ))
+    elif goal_id == "break_exploration_stall":
+        target = dict(goal.get("target") or {})
+        if target:
+            steps.append(PlanStep(
+                kind="go_to",
+                target={
+                    "x": int(target.get("gx", pos_tuple(state)[0])),
+                    "y": int(target.get("gy", pos_tuple(state)[1])),
+                    "z": int(target.get("gz", pos_tuple(state)[2])),
+                },
+                params={"arrival_radius": 1},
+                completion={"type": "arrived_near"},
+            ))
+        else:
+            steps.append(PlanStep(
+                kind="explore",
+                params={"max_successful_moves": 12, "successful_moves": 0},
+                completion={"type": "explore_budget"},
+            ))
     elif goal_id == "approach_consumable":
         target = dict(goal.get("target") or {})
         if target:
@@ -1998,6 +2219,8 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
 
     if plan.goal_id == "leave_shoreline" and not wm.shoreline_escape_active:
         return "shoreline_cleared"
+    if plan.goal_id == "break_exploration_stall" and not wm.strategic_stall_active:
+        return "strategic_stall_cleared"
 
     if plan.provenance == "fast_frontier" and needs_qwen_judgment(state, wm, actions):
         return "meaningful_judgment_event"
@@ -3081,6 +3304,9 @@ def main() -> int:
             "stall_escape_active": bool(wm.stall_avoid_tiles),
             "shoreline_escape_active": wm.shoreline_escape_active,
             "current_water_distance": wm.nearest_known_water_distance(pos_tuple(state)),
+            "strategic_stall_active": wm.strategic_stall_active,
+            "strategic_progress": strategic_progress_summary(wm),
+            "known_structure_targets": known_structure_targets(state, wm)[:5],
                 },
             })
     
