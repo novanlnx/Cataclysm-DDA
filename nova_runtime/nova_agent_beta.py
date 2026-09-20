@@ -450,6 +450,9 @@ class WorldModel:
                     "terrain": t.get("terrain", ""),
                     "passable": bool(t.get("passable")),
                     "openable": bool(t.get("openable")),
+                    "swimmable": bool(t.get("swimmable")),
+                    "deep_water": bool(t.get("deep_water")),
+                    "dangerous": bool(t.get("dangerous")),
                     "items": list(t.get("items") or []),
                     "ground_consumables": [
                         dict(x) for x in (t.get("ground_consumables") or [])
@@ -616,10 +619,21 @@ def situation_summary(state: dict, wm: WorldModel) -> dict:
         t = tiles.get((dx, dy))
         if t and t.get("openable"):
             doors.append({"direction": name, "terrain": t.get("terrain", "")})
+    adjacent_terrain = []
     for name, (dx, dy) in MOVE_DIRECTIONS.items():
         t = tiles.get((dx, dy))
-        if t and t.get("passable"):
+        if not t:
+            continue
+        if t.get("passable"):
             open_moves.append(name)
+        adjacent_terrain.append({
+            "direction": name,
+            "terrain": t.get("terrain", ""),
+            "passable": bool(t.get("passable")),
+            "swimmable": bool(t.get("swimmable")),
+            "deep_water": bool(t.get("deep_water")),
+            "dangerous": bool(t.get("dangerous")),
+        })
 
     hostiles = []
     for c in state.get("nearby_creatures", []):
@@ -643,6 +657,7 @@ def situation_summary(state: dict, wm: WorldModel) -> dict:
         "indoors": bool(state.get("indoors")),
         "adjacent_closed_doors": doors,
         "open_directions": open_moves,
+        "adjacent_terrain": adjacent_terrain,
         "visible_items": visible_items[:8],
         "nearby_hostiles": hostiles[:8],
         "current_tile_visits": wm.visits.get(pos_tuple(state), 0),
@@ -1178,13 +1193,26 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
         backtrack = wm.is_immediate_backtrack(state, dx, dy)
 
         if t.get("passable"):
-            # A native CDDA refusal is evidence.  Do not hammer the same
+            # Deep water and game-marked dangerous tiles are not ordinary
+            # exploration footsteps. They require a deliberate interaction
+            # policy that this validation runtime does not expose yet.
+            if bool(t.get("deep_water")) or bool(t.get("dangerous")):
+                continue
+
+            # A native CDDA refusal is evidence. Do not hammer the same
             # source->target edge repeatedly just because terrain is nominally passable.
             if wm.is_known_blocked_edge(state, dx, dy):
                 continue
 
+            shallow_water = bool(t.get("swimmable"))
             novelty = 1.0 / (1.0 + visits)
             score = 0.58 + 0.30 * novelty
+            if shallow_water:
+                # Shallow water is traversable, but it should not attract the
+                # frontier walker merely because it is unvisited. Prefer dry
+                # ground and use shallow water only when it is genuinely the
+                # remaining route.
+                score -= 0.45
             resource_distance_delta = 0
             nearest_resource = None
             if known_resources:
@@ -1219,6 +1247,10 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "label": f"move {name}",
                 "terrain": t.get("terrain", ""),
                 "target_indoors": bool(t.get("indoors", False)),
+                "swimmable": shallow_water,
+                "deep_water": bool(t.get("deep_water")),
+                "dangerous": bool(t.get("dangerous")),
+                "navigation_rank": 1 if shallow_water else 0,
                 "visits_target": visits,
                 "immediate_backtrack": backtrack,
                 "hostile_on_tile": (dx, dy) in hostiles,
@@ -1299,7 +1331,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> bool:
     # Qwen is for judgment, not footsteps. Empty, repetitive traversal should
     # stay fast until something appears that can materially change the choice.
-    if wm.looping():
+    if wm.looping() or wm.no_progress_streak >= 2:
         return True
     if any(str(c.get("attitude", "")).lower() == "hostile"
            for c in state.get("nearby_creatures", [])):
@@ -1487,6 +1519,7 @@ def deterministic_explore_choice(step: PlanStep, actions: list[dict]) -> dict | 
     ]
     if moves:
         moves.sort(key=lambda a: (
+            int(a.get("navigation_rank", 0) or 0),
             int(a.get("visits_target", 0) or 0),
             1 if a.get("immediate_backtrack") else 0,
             -float(a.get("controller_score", 0.0)),
