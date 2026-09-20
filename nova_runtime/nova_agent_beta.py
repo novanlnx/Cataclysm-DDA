@@ -448,7 +448,12 @@ class WorldModel:
     hazard_tiles: set[tuple[int, int, int]] = field(default_factory=set)
     stall_avoid_tiles: set[tuple[int, int, int]] = field(default_factory=set)
     known_landmarks: dict[tuple[int, int, int], dict] = field(default_factory=dict)
+    failed_landmarks: set[tuple[int, int, int]] = field(default_factory=set)
     shelter_anchor: tuple[int, int, int] | None = None
+    last_planner_assessment: str = ""
+    last_planner_blocker: str = ""
+    last_planner_next_step: str = ""
+    last_action_summary: str = ""
     active_goal_id: str = ""
     active_intention: str = ""
     priority_context: dict = field(default_factory=dict)
@@ -746,6 +751,65 @@ class Plan:
             "provenance": self.provenance,
             "steps": [step.to_dict() for step in self.steps],
         }
+
+class DashboardFeed:
+    def __init__(self) -> None:
+        self.mission_path = BRIDGE / "nova-mission.txt"
+        self.mind_path = BRIDGE / "nova-mind.txt"
+        self.status_path = BRIDGE / "nova-status.txt"
+
+    @staticmethod
+    def _clean(text: object, limit: int = 180) -> str:
+        value = " ".join(str(text or "").replace("\n", " ").split())
+        return value[:limit]
+
+    def update(self, state: dict, wm: WorldModel, plan: Plan | None,
+               matched_lessons: list[dict] | None = None,
+               blocker: str = "") -> None:
+        phase = mission_phase(state, wm)
+        goal = plan.goal_id if plan else (wm.active_goal_id or "reassess")
+        intention = plan.intention if plan else (wm.active_intention or "reassess situation")
+        step = "none"
+        if plan and plan.current_step:
+            step = f"{plan.step_index + 1}/{len(plan.steps)} {plan.current_step.kind}"
+        targets = known_structure_targets(state, wm)
+        target_line = "none known"
+        if targets:
+            t = targets[0]
+            target_line = f"{t.get('kind')} {t.get('terrain')} d={t.get('distance')}"
+
+        mission_lines = [
+            f"MISSION: {self._clean(SURVIVAL_MISSION, 120)}",
+            f"PHASE: {phase}",
+            f"GOAL: {goal}",
+            f"TARGET: {self._clean(target_line, 120)}",
+        ]
+        mind_lines = [
+            f"INTENT: {self._clean(intention, 150)}",
+            f"ASSESS: {self._clean(wm.last_planner_assessment or 'using deterministic execution', 150)}",
+            f"NEXT: {self._clean(wm.last_planner_next_step or step, 150)}",
+            f"BLOCKER: {self._clean(blocker or wm.last_planner_blocker or 'none', 150)}",
+            f"PLAN STEP: {self._clean(step, 120)}",
+        ]
+        hostiles = [
+            c for c in state.get("nearby_creatures", [])
+            if str(c.get("attitude", "")).lower() == "hostile"
+        ]
+        lesson_line = "none"
+        if matched_lessons:
+            lesson_line = ", ".join(str(m.get("lesson_id")) for m in matched_lessons[:2])
+        status_lines = [
+            f"NEEDS: hunger={state.get('hunger')} thirst={state.get('thirst')} stamina={state.get('stamina')}/{state.get('stamina_max')}",
+            f"PLACE: {'indoors' if state.get('indoors') else 'outdoors'} | hostiles={len(hostiles)} | landmarks={len(wm.known_landmarks)}",
+            f"LAST: {self._clean(wm.last_action_summary or 'none yet', 150)}",
+            f"MEMORY: {self._clean(lesson_line, 120)}",
+        ]
+        try:
+            write_text_atomic(self.mission_path, "\n".join(mission_lines) + "\n")
+            write_text_atomic(self.mind_path, "\n".join(mind_lines) + "\n")
+            write_text_atomic(self.status_path, "\n".join(status_lines) + "\n")
+        except OSError:
+            pass
 
 class ThoughtFeed:
     def __init__(self) -> None:
@@ -1204,7 +1268,7 @@ def known_structure_targets(state: dict, wm: WorldModel | None) -> list[dict]:
     seen = set()
 
     for (gx, gy, gz), landmark in wm.known_landmarks.items():
-        if gz != pz:
+        if gz != pz or (gx, gy, gz) in wm.failed_landmarks:
             continue
         dx = gx - px
         dy = gy - py
@@ -1256,7 +1320,7 @@ def known_structure_targets(state: dict, wm: WorldModel | None) -> list[dict]:
             "strategic_landmark": False,
         })
     targets.sort(key=lambda t: (
-        0 if t.get("kind") == "boundary" else 1,
+        0 if t.get("kind") in {"boundary", "shelter_entrance"} else 1,
         1 if t.get("visited") else 0,
         int(t.get("distance", 999)),
     ))
@@ -2115,12 +2179,18 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
                 params={"arrival_radius": 1},
                 completion={"type": "arrived_near"},
             ))
-            if target.get("kind") == "boundary":
+            if target.get("kind") in {"boundary", "shelter_entrance"}:
                 steps.append(PlanStep(
                     kind="interact",
                     target=abs_target,
                     params={"action": "open_adjacent"},
                     completion={"type": "opened"},
+                ))
+                steps.append(PlanStep(
+                    kind="go_to",
+                    target=abs_target,
+                    params={"arrival_radius": 0},
+                    completion={"type": "entered_threshold"},
                 ))
     elif goal_id == "break_exploration_stall":
         target = dict(goal.get("target") or {})
@@ -2280,7 +2350,8 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
         "Use measured needs and feasible affordances only. "
         "Do not invent goals or actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
-        'Schema: {"goal_id":"exact candidate id","intention":"short purpose","reason":"one short evidence-grounded reason"}.'
+        "Also provide brief user-facing telemetry: assessment, blocker, and next_step. "
+        'Schema: {"goal_id":"exact candidate id","intention":"short purpose","reason":"one short evidence-grounded reason","assessment":"one sentence about the situation","blocker":"one short blocker or none","next_step":"one short next step"}.'
     )
     payload = {
         "model": model,
@@ -2304,6 +2375,9 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
         provenance = "planner_fallback"
     reason = str(parsed.get("reason", "")).strip()[:300]
     intention = str(parsed.get("intention", "")).strip()[:180]
+    wm.last_planner_assessment = str(parsed.get("assessment", "")).strip()[:240]
+    wm.last_planner_blocker = str(parsed.get("blocker", "")).strip()[:180]
+    wm.last_planner_next_step = str(parsed.get("next_step", "")).strip()[:180]
     if intention:
         chosen = dict(chosen)
         chosen["intention"] = intention
@@ -3019,6 +3093,7 @@ def main() -> int:
     model_trace_path = LOG_DIR / f"nova-model-trace-{stamp}.jsonl"
     wm = WorldModel()
     feed = ThoughtFeed()
+    dashboard = DashboardFeed()
     evolution_state = load_evolution_state()
     must_wait_for_respawn = recover_previous_runtime(evolution_state, log_path)
     life_number = int(
@@ -3168,6 +3243,7 @@ def main() -> int:
                     })
 
             feed.push("SEE: " + describe_situation(sit))
+            dashboard.update(state, wm, plan, matched_lessons)
     
             if plan and plan.completed:
                 append_log(log_path, {
@@ -3233,6 +3309,7 @@ def main() -> int:
                     "position": state.get("position"),
                 })
                 feed.push("INTENT: " + plan.intention)
+                dashboard.update(state, wm, plan, matched_lessons)
     
             # A step can already be complete when the previous step placed Nova at
             # its completion boundary. Advance without spending a game action.
@@ -3265,7 +3342,19 @@ def main() -> int:
                     "state": state,
                 })
                 feed.push("PLAN: step blocked — " + executor_reason)
+                wm.last_planner_blocker = executor_reason
+                dashboard.update(state, wm, plan, matched_lessons, blocker=executor_reason)
                 if step.failure_count >= 2:
+                    if plan.goal_id == "approach_known_structure" and step.target:
+                        try:
+                            failed_key = (
+                                int(step.target.get("x")),
+                                int(step.target.get("y")),
+                                int(step.target.get("z")),
+                            )
+                            wm.failed_landmarks.add(failed_key)
+                        except Exception:
+                            pass
                     plan = None
                     wm.active_goal_id = ""
                     wm.active_intention = ""
@@ -3317,6 +3406,7 @@ def main() -> int:
             action_count += 1
             outcome = result.get("outcome") if result else "command_error"
             bridge_latency = round(time.monotonic() - started, 3)
+            wm.last_action_summary = f"{action} -> {outcome}"
     
             if command_error:
                 append_log(log_path, {
@@ -3337,6 +3427,7 @@ def main() -> int:
                 break
     
             wm.record_action(state_before, choice, outcome, result)
+            dashboard.update(state, wm, plan, matched_lessons)
     
             # Option A activity contract: with the native C++ gate, this observe
             # should not be serviced until the current activity has completed.
