@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -31,6 +32,8 @@ DEFAULT_BRIDGE = ROOT / "nova-ipc-validation"
 BRIDGE = Path(os.environ.get("NOVA_BRIDGE_DIR", str(DEFAULT_BRIDGE)))
 COMMAND = BRIDGE / "command.json"
 LIFE_STATUS = BRIDGE / "life-status.json"
+VALIDATION_STATE = BRIDGE / "validation-state"
+VALIDATION_LOGS = BRIDGE / "validation-logs"
 
 
 @dataclass
@@ -321,13 +324,69 @@ def batch1_suite() -> list[Check]:
 
 def death_suite() -> list[Check]:
     checks: list[Check] = []
+
+    if BRIDGE.resolve() == (ROOT / "nova-ipc").resolve():
+        raise ValidationFailure(
+            "Refusing destructive lifecycle validation on the normal nova-ipc directory. "
+            "Use START_NOVA_VALIDATION.cmd and a disposable character."
+        )
+
     add_check(checks, "validation guard + observe", lambda: (
         "bridge reports validation_mode=true"
         if assert_validation_mode()
         else "unreachable"
     ))
 
-    def kill_and_verify():
+    shutil.rmtree(VALIDATION_STATE, ignore_errors=True)
+    shutil.rmtree(VALIDATION_LOGS, ignore_errors=True)
+    VALIDATION_STATE.mkdir(parents=True, exist_ok=True)
+    VALIDATION_LOGS.mkdir(parents=True, exist_ok=True)
+
+    # Import the real controller against isolated validation state.  This makes
+    # the lifecycle test exercise the production lesson/evolution code without
+    # touching Life 1's durable files.
+    os.environ["NOVA_STATE_DIR"] = str(VALIDATION_STATE)
+    os.environ["NOVA_LOG_DIR"] = str(VALIDATION_LOGS)
+    os.environ["NOVA_BRIDGE_DIR"] = str(BRIDGE)
+    import nova_agent_beta as agent
+
+    context: dict[str, object] = {}
+
+    def prepare_life_one():
+        hunger = send("validation_set_hunger", value=100)
+        require_success(hunger, {"validation_value_set"})
+        thirst = send("validation_set_thirst", value=100)
+        require_success(thirst, {"validation_value_set"})
+        observed = send("observe")
+        require_success(observed, {"observed"})
+        state = state_from(observed)
+        if not bool(state.get("validation_mode")):
+            raise ValidationFailure("validation mode disappeared before lifecycle setup")
+
+        evolution = agent.load_evolution_state()
+        life = agent.ensure_current_life(evolution, state)
+        seeded_action = {
+            "action": "wait_one_turn",
+            "label": "deterministic lifecycle lesson seed",
+        }
+        life.record_action(
+            state, state, seeded_action, "waited",
+            {"evidence": "validation_seed_action"},
+        )
+        life.observe(state, 1, force_sample=True)
+        agent.write_active_life_marker(life)
+
+        context["state"] = state
+        context["evolution"] = evolution
+        context["life"] = life
+        return (
+            f"isolated Life 1 created as {life.life_id[:8]} with deterministic "
+            "last_action=wait_one_turn and critical hunger/thirst"
+        )
+
+    add_check(checks, "prepare isolated Life 1 lesson conditions", prepare_life_one)
+
+    def kill_and_verify_native():
         response = send("validation_kill_character", timeout=30.0)
         require_success(response, {"validation_character_killed"})
         if not bool(state_from(response).get("dead")):
@@ -343,9 +402,181 @@ def death_suite() -> list[Check]:
             return status if status.get("dead") or status.get("status") == "dead" else None
 
         status = wait_for(dead_status, 15.0, "life-status.json dead state")
+        context["death_status"] = status
         return f"native death and life-status propagation verified ({status.get('status')})"
 
-    add_check(checks, "forced deterministic death", kill_and_verify)
+    add_check(checks, "forced deterministic native death", kill_and_verify_native)
+
+    def process_death_to_lesson():
+        evolution = context.get("evolution")
+        life = context.get("life")
+        if not isinstance(evolution, dict) or life is None:
+            raise ValidationFailure("lifecycle setup context is missing")
+
+        log_path = VALIDATION_LOGS / "lifecycle-validation.jsonl"
+        processed = agent.recover_previous_runtime(evolution, log_path)
+        if not processed:
+            raise ValidationFailure("production recover_previous_runtime did not consume the death")
+
+        history = agent.load_recent_life_history(limit=20, include_aborted=True)
+        lessons = agent.load_lessons(limit=20)
+        matching_records = [
+            record for record in history
+            if record.get("life_id") == life.life_id and record.get("terminal_state") == "dead"
+        ]
+        matching_lessons = [
+            lesson for lesson in lessons
+            if lesson.get("source_life_id") == life.life_id
+        ]
+        if len(matching_records) != 1:
+            raise ValidationFailure(
+                f"expected exactly one dead terminal record, found {len(matching_records)}"
+            )
+        if len(matching_lessons) != 1:
+            raise ValidationFailure(
+                f"expected exactly one death lesson, found {len(matching_lessons)}"
+            )
+        lesson = matching_lessons[0]
+        if lesson.get("at_death_action") != "wait_one_turn":
+            raise ValidationFailure(
+                f"lesson recorded wrong death action: {lesson.get('at_death_action')!r}"
+            )
+
+        evolved = agent.load_evolution_state()
+        if int(evolved.get("lives_completed", 0) or 0) != 1:
+            raise ValidationFailure(f"lives_completed is not 1: {evolved}")
+        if int(evolved.get("next_life_number", 0) or 0) != 2:
+            raise ValidationFailure(f"next_life_number is not 2: {evolved}")
+
+        context["log_path"] = log_path
+        context["lesson"] = lesson
+        context["evolved"] = evolved
+        return (
+            f"death produced exactly one lesson {lesson.get('lesson_id')} and "
+            "advanced evolution state to Life 2"
+        )
+
+    add_check(checks, "death -> terminal record -> lesson", process_death_to_lesson)
+
+    def duplicate_death_guard():
+        evolved = context.get("evolved")
+        log_path = context.get("log_path")
+        if not isinstance(evolved, dict) or not isinstance(log_path, Path):
+            raise ValidationFailure("processed death context is missing")
+
+        consumed = load_json(agent.CONSUMED_LIFE_STATUS_PATH)
+        status = consumed.get("status")
+        if not isinstance(status, dict):
+            raise ValidationFailure("consumed death status was not archived")
+        agent.write_json_atomic(agent.LIFE_STATUS_PATH, status)
+
+        history_before = len(agent.load_recent_life_history(limit=100, include_aborted=True))
+        lessons_before = len(agent.load_lessons(limit=100))
+        processed = agent.recover_previous_runtime(evolved, log_path)
+        if not processed:
+            raise ValidationFailure("duplicate death signature was not recognized")
+        history_after = len(agent.load_recent_life_history(limit=100, include_aborted=True))
+        lessons_after = len(agent.load_lessons(limit=100))
+        if history_after != history_before or lessons_after != lessons_before:
+            raise ValidationFailure(
+                "duplicate death created an extra terminal record or lesson "
+                f"(history {history_before}->{history_after}, lessons {lessons_before}->{lessons_after})"
+            )
+        return "duplicate death signature was consumed without duplicating history or lessons"
+
+    add_check(checks, "exactly-once duplicate death guard", duplicate_death_guard)
+
+    def life_two_inheritance_and_visible_memory():
+        original = context.get("state")
+        evolved = context.get("evolved")
+        lesson = context.get("lesson")
+        log_path = context.get("log_path")
+        if not isinstance(original, dict) or not isinstance(evolved, dict) or not isinstance(lesson, dict):
+            raise ValidationFailure("inheritance context is missing")
+        if not isinstance(log_path, Path):
+            raise ValidationFailure("lifecycle log path is missing")
+
+        next_state = dict(original)
+        next_state["dead"] = False
+        # Keep the critical hunger/thirst and indoor/outdoor context identical so
+        # the derived lesson has a deterministic >=3-condition match.
+        life2 = agent.ensure_current_life(evolved, next_state)
+        if life2.life_number != 2:
+            raise ValidationFailure(f"expected Life 2, got Life {life2.life_number}")
+        life1 = context.get("life")
+        if life1 is not None and life2.life_id == life1.life_id:
+            raise ValidationFailure("Life 2 incorrectly reused Life 1 identity")
+
+        candidate_actions = [{
+            "action": "wait_one_turn",
+            "label": "matching action for inherited lesson test",
+            "controller_score": 0.80,
+        }]
+        biased, matches = agent.apply_lesson_bias(
+            next_state, candidate_actions, agent.load_lessons(limit=20)
+        )
+        lesson_id = str(lesson.get("lesson_id"))
+        matched_ids = {str(m.get("lesson_id")) for m in matches}
+        if lesson_id not in matched_ids:
+            raise ValidationFailure(
+                f"Life 2 did not retrieve/match inherited lesson {lesson_id}; matches={matches}"
+            )
+        if not biased or float(biased[0].get("controller_score", 1.0)) >= 0.80:
+            raise ValidationFailure(f"lesson matched but did not reduce action score: {biased}")
+        bias = biased[0].get("lesson_bias") or {}
+        if lesson_id not in {str(x) for x in bias.get("lesson_ids") or []}:
+            raise ValidationFailure(f"biased action does not cite inherited lesson: {biased[0]}")
+
+        wm = agent.WorldModel()
+        wm.observe(next_state)
+        feed = agent.ThoughtFeed()
+        dashboard = agent.DashboardFeed()
+        priority_context = {"tier": 4, "name": "validation", "reason": "lifecycle test"}
+        fired = agent.publish_lesson_signal(
+            wm, matches, feed, log_path, life2, priority_context, next_state
+        )
+        if not fired:
+            raise ValidationFailure("production lesson signal helper did not fire for Life 2")
+        dashboard.update(next_state, wm, None, matches)
+
+        thought_text = (agent.BRIDGE / "nova-thoughts.txt").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        status_text = (agent.BRIDGE / "nova-status.txt").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        if "MEMORY: biasing away from wait_one_turn" not in thought_text:
+            raise ValidationFailure(
+                "visible thought feed did not show the inherited memory signal"
+            )
+        if lesson_id not in status_text:
+            raise ValidationFailure(
+                "Nova Status MEMORY line did not display the inherited lesson id"
+            )
+
+        log_lines = log_path.read_text(encoding="utf-8").splitlines()
+        fired_events = []
+        for line in log_lines:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("session_event") == "lesson_fired":
+                fired_events.append(payload)
+        if not fired_events:
+            raise ValidationFailure("no lesson_fired event was written to cognition log")
+
+        return (
+            f"Life 2 ({life2.life_id[:8]}) inherited {lesson_id}, action score "
+            f"{candidate_actions[0]['controller_score']:.2f}->{float(biased[0]['controller_score']):.2f}, "
+            "and visible MEMORY/log signals fired"
+        )
+
+    add_check(
+        checks,
+        "Life 2 lesson inheritance + behavioral bias + visible MEMORY",
+        life_two_inheritance_and_visible_memory,
+    )
     return checks
 
 
