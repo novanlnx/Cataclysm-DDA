@@ -58,11 +58,16 @@ VALIDATION_DISPATCH_ALLOWLIST = {
     "observe",
     "move_one_tile",
     "open_adjacent",
+    "close_adjacent",
     "wait_one_turn",
     "pickup_consumable",
     "pickup_item",
+    "wield_item",
+    "wear_item",
     "eat_best_food",
     "drink_best",
+    "sleep",
+    "quicksave",
 }
 
 MIN_HUNGER_IMPROVEMENT = 5
@@ -74,6 +79,7 @@ MIN_STORED_KCAL_IMPROVEMENT = 10
 # real CDDA before/after evidence justifies richer appetite logic.
 EAT_NEED_HUNGER = 20
 DRINK_NEED_THIRST = 20
+SLEEP_NEED_SLEEPINESS = 50
 
 THREAT_RANGE_TILES = 3
 CRITICAL_NEED_THRESHOLD = 80
@@ -987,12 +993,15 @@ def need_profile(state: dict) -> dict:
     thirst = int(state.get("thirst", 0) or 0)
     stamina = int(state.get("stamina", 0) or 0)
     stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
+    sleepiness = int(state.get("sleepiness", 0) or 0)
     return {
         "hunger": hunger,
         "thirst": thirst,
+        "sleepiness": sleepiness,
         "stamina_ratio": stamina / stamina_max,
         "eat_needed": hunger >= EAT_NEED_HUNGER,
         "drink_needed": thirst >= DRINK_NEED_THIRST,
+        "sleep_needed": sleepiness >= SLEEP_NEED_SLEEPINESS,
     }
 
 def lesson_conditions(state: dict) -> dict:
@@ -1607,6 +1616,57 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
                 "name": name,
             },
         })
+    wield_actions = [a for a in actions if a.get("action") == "wield_item"]
+    for index, equip in enumerate(wield_actions[:6]):
+        profile = dict(equip.get("item_profile") or {})
+        name = str(equip.get("item_name", "")).strip() or "carried weapon"
+        candidates.append({
+            "goal_id": f"equip_weapon_{index}",
+            "intention": f"wield {name} if it improves immediate survival readiness",
+            "supported_by": ["wield_item"],
+            "priority": 0.68,
+            "target_item": {
+                "name": name,
+                "type_id": equip.get("item_type_id"),
+                "profile": profile,
+            },
+        })
+
+    wear_actions = [a for a in actions if a.get("action") == "wear_item"]
+    for index, wear in enumerate(wear_actions[:6]):
+        profile = dict(wear.get("item_profile") or {})
+        name = str(wear.get("item_name", "")).strip() or "carried clothing"
+        candidates.append({
+            "goal_id": f"wear_gear_{index}",
+            "intention": f"wear {name} if its protection or utility plausibly improves survival",
+            "supported_by": ["wear_item"],
+            "priority": 0.64,
+            "target_item": {
+                "name": name,
+                "type_id": wear.get("item_type_id"),
+                "profile": profile,
+            },
+        })
+
+    if "sleep" in action_names and bool(needs.get("sleep_needed")):
+        candidates.append({
+            "goal_id": "sleep_safely",
+            "intention": "sleep in the secured hostile-free interior to recover from meaningful fatigue",
+            "supported_by": ["sleep"],
+            "priority": min(
+                0.94,
+                0.74 + max(0, int(needs.get("sleepiness", 0)) - SLEEP_NEED_SLEEPINESS) / 120.0,
+            ),
+        })
+
+    if "close_adjacent" in action_names and bool(state.get("indoors")):
+        candidates.append({
+            "goal_id": "secure_open_boundary",
+            "intention": "close an exposed nearby door if doing so improves shelter security",
+            "supported_by": ["close_adjacent"],
+            "priority": 0.55,
+        })
+
     if "open_adjacent" in action_names:
         candidates.append({
             "goal_id": "open_boundary",
@@ -1783,6 +1843,18 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             "label": label,
             "controller_score": min(1.0, score),
             "progress": progress,
+            "target_indoors": bool(t.get("indoors", False)),
+        })
+
+    for name, (dx, dy) in CARDINALS.items():
+        t = tiles.get((dx, dy))
+        if not t or not t.get("closable"):
+            continue
+        actions.append({
+            "action": "close_adjacent", "dx": dx, "dy": dy,
+            "label": f"close {name} {t.get('terrain') or 'door'}",
+            "controller_score": 0.42 if state.get("indoors") else 0.18,
+            "progress": "secures an open boundary",
             "target_indoors": bool(t.get("indoors", False)),
         })
 
@@ -1996,6 +2068,54 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "generic_item": True,
             })
 
+    inventory_items = [
+        item for item in (state.get("inventory_items") or [])
+        if isinstance(item, dict)
+    ]
+    currently_wielded = next(
+        (item for item in inventory_items if bool(item.get("wielded"))), None
+    )
+    if currently_wielded is None:
+        equipment_options = [
+            item for item in inventory_items
+            if bool(item.get("can_wield"))
+            and not bool(item.get("wielded"))
+            and (bool(item.get("melee")) or bool(item.get("gun")))
+        ]
+        for item in equipment_options[:8]:
+            name = str(item.get("name", "")).strip()
+            type_id = str(item.get("type_id", "")).strip()
+            if not name:
+                continue
+            actions.append({
+                "action": "wield_item",
+                "item_name": name,
+                "item_type_id": type_id,
+                "label": f"wield {name}",
+                "controller_score": 0.60 + (0.08 if item.get("gun") else 0.04),
+                "progress": "equips a carried weapon-capable item",
+                "item_profile": dict(item),
+            })
+
+    wearable_options = [
+        item for item in inventory_items
+        if bool(item.get("armor")) and bool(item.get("can_wear")) and not bool(item.get("worn"))
+    ]
+    for item in wearable_options[:8]:
+        name = str(item.get("name", "")).strip()
+        type_id = str(item.get("type_id", "")).strip()
+        if not name:
+            continue
+        actions.append({
+            "action": "wear_item",
+            "item_name": name,
+            "item_type_id": type_id,
+            "label": f"wear {name}",
+            "controller_score": 0.56,
+            "progress": "equips carried protective or utility clothing",
+            "item_profile": dict(item),
+        })
+
     consumables = state.get("inventory_consumables", [])
     needs = need_profile(state)
     hunger = int(needs["hunger"])
@@ -2025,6 +2145,26 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             "controller_score": 0.2 if stamina_ratio >= 0.25 else 0.8,
             "wait_reason": "recover_stamina",
         })
+
+    hostile_nearby = any(
+        str(critter.get("attitude", "")).lower() == "hostile"
+        and max(abs(int(critter.get("dx", 99) or 99)), abs(int(critter.get("dy", 99) or 99))) <= 5
+        for critter in (state.get("nearby_creatures") or [])
+    )
+    if bool(state.get("indoors")) and not hostile_nearby and bool(needs.get("sleep_needed")):
+        sleepiness = int(needs.get("sleepiness", 0) or 0)
+        actions.append({
+            "action": "sleep",
+            "duration_minutes": 480,
+            "label": "sleep in the secured interior because fatigue is meaningful",
+            "controller_score": min(0.92, 0.62 + max(0, sleepiness - SLEEP_NEED_SLEEPINESS) / 160.0),
+            "need_evidence": {
+                "sleepiness": sleepiness,
+                "threshold": SLEEP_NEED_SLEEPINESS,
+                "indoors": True,
+                "hostile_nearby": False,
+            },
+        })
     elif not actions:
         actions.append({
             "action": "wait_one_turn",
@@ -2049,8 +2189,10 @@ def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> boo
         return True
     if any(t.get("openable") for t in state.get("local_tiles", [])):
         return True
-    if any(a.get("action") in {"pickup_consumable", "pickup_item", "eat_best_food", "drink_best"}
-           for a in actions):
+    if any(a.get("action") in {
+        "pickup_consumable", "pickup_item", "wield_item", "wear_item",
+        "eat_best_food", "drink_best", "sleep", "close_adjacent"
+    } for a in actions):
         return True
     if any(a.get("lesson_bias") or a.get("threat_response") or a.get("shelter_preference")
            for a in actions):
@@ -2140,6 +2282,7 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         "recent_actions": list(wm.recent_actions)[-8:],
         "recent_positions": list(wm.recent_positions)[-8:],
         "carried_consumables": state.get("inventory_consumables", []),
+        "inventory_items": (state.get("inventory_items") or [])[:40],
         "rules": {
             "avoid_repeated_pacing": True,
             "prefer_progress_over_safe_repetition": True,
@@ -2186,11 +2329,16 @@ def plan_step_complete_before_action(step: PlanStep, state: dict) -> bool:
 def select_interaction(actions: list[dict], action_name: str,
                        item_name: str | None = None,
                        target: dict | None = None,
-                       state: dict | None = None) -> dict | None:
+                       state: dict | None = None,
+                       item_type_id: str | None = None) -> dict | None:
     candidates = [a for a in actions if a.get("action") == action_name]
     if item_name:
         candidates = [a for a in candidates if a.get("item_name") == item_name]
-    if target and state and action_name in {"pickup_consumable", "pickup_item", "open_adjacent"}:
+    if item_type_id:
+        candidates = [a for a in candidates if a.get("item_type_id") == item_type_id]
+    if target and state and action_name in {
+        "pickup_consumable", "pickup_item", "open_adjacent", "close_adjacent"
+    }:
         x, y, _ = pos_tuple(state)
         tx = int(target.get("x", x))
         ty = int(target.get("y", y))
@@ -2541,7 +2689,10 @@ def execute_step(plan: Plan, state: dict, wm: WorldModel,
     if step.kind == "interact":
         action_name = str(step.params.get("action", ""))
         item_name = step.params.get("item_name")
-        choice = select_interaction(actions, action_name, item_name, step.target, state)
+        item_type_id = step.params.get("item_type_id")
+        choice = select_interaction(
+            actions, action_name, item_name, step.target, state, item_type_id
+        )
         if choice:
             choice = dict(choice)
             choice["reason"] = f"executor performs committed interaction {action_name}"
@@ -2682,6 +2833,52 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
                 ),
                 params={"action": "pickup_item", "item_name": target.get("name")},
                 completion={"type": "pickup_verified", "item_name": target.get("name")},
+            ))
+    elif goal_id.startswith("equip_weapon_"):
+        target = dict(goal.get("target_item") or {})
+        if target:
+            steps.append(PlanStep(
+                kind="interact",
+                params={
+                    "action": "wield_item",
+                    "item_name": target.get("name"),
+                    "item_type_id": target.get("type_id"),
+                },
+                completion={"type": "wield_verified", "item_type_id": target.get("type_id")},
+            ))
+    elif goal_id.startswith("wear_gear_"):
+        target = dict(goal.get("target_item") or {})
+        if target:
+            steps.append(PlanStep(
+                kind="interact",
+                params={
+                    "action": "wear_item",
+                    "item_name": target.get("name"),
+                    "item_type_id": target.get("type_id"),
+                },
+                completion={"type": "wear_verified", "item_type_id": target.get("type_id")},
+            ))
+    elif goal_id == "sleep_safely":
+        steps.append(PlanStep(
+            kind="interact",
+            params={"action": "sleep", "duration_minutes": 480},
+            completion={"type": "sleep_verified"},
+        ))
+    elif goal_id == "secure_open_boundary":
+        doors = [a for a in actions if a.get("action") == "close_adjacent"]
+        if doors:
+            doors.sort(key=lambda a: (
+                -float(a.get("controller_score", 0.0)),
+                stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+            ))
+            d = doors[0]
+            steps.append(PlanStep(
+                kind="interact",
+                target=absolute_target_from_relative(
+                    state, int(d.get("dx", 0)), int(d.get("dy", 0))
+                ),
+                params={"action": "close_adjacent"},
+                completion={"type": "closed"},
             ))
     elif goal_id == "open_boundary":
         doors = [a for a in actions if a.get("action") == "open_adjacent"]
@@ -2918,7 +3115,10 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
     if step.kind == "interact":
         action_name = step.params.get("action")
         item_name = step.params.get("item_name")
-        if select_interaction(actions, action_name, item_name, step.target, state) is None:
+        item_type_id = step.params.get("item_type_id")
+        if select_interaction(
+            actions, action_name, item_name, step.target, state, item_type_id
+        ) is None:
             return "current_step_unsupported"
     return None
 
@@ -3055,6 +3255,51 @@ def verify_step(plan: Plan, action: dict, outcome: str, before: dict,
         if action_name == "open_adjacent":
             verified = outcome == "opened"
             return verified, verified, {"evidence": "native_opened", "outcome": outcome}
+        if action_name == "close_adjacent":
+            verified = outcome == "closed"
+            return verified, verified, {"evidence": "native_closed", "outcome": outcome}
+        if action_name in {"wield_item", "wear_item"}:
+            type_id = str(step.params.get("item_type_id") or "")
+            name = str(step.params.get("item_name") or "")
+            inventory = [
+                item for item in (after.get("inventory_items") or [])
+                if isinstance(item, dict)
+            ]
+            matching = [
+                item for item in inventory
+                if (not type_id or str(item.get("type_id") or "") == type_id)
+                and (not name or str(item.get("name") or "") == name)
+            ]
+            if action_name == "wield_item":
+                verified = outcome in {"wield_verified", "already_wielded"} and any(
+                    bool(item.get("wielded")) for item in matching
+                )
+            else:
+                verified = outcome in {"wear_verified", "already_worn"} and any(
+                    bool(item.get("worn")) for item in matching
+                )
+            return verified, verified, {
+                "evidence": "equipment_state_verified",
+                "equipment_action": action_name,
+                "item_name": name,
+                "item_type_id": type_id,
+                "outcome": outcome,
+                "matching_post_state": matching[:3],
+            }
+        if action_name == "sleep":
+            before_sleepiness = int(before.get("sleepiness", 0) or 0)
+            after_sleepiness = int(after.get("sleepiness", 0) or 0)
+            activity_complete = str(after.get("activity", "") or "") == ""
+            started = outcome == "sleep_activity_started"
+            improved = after_sleepiness < before_sleepiness
+            verified = started and activity_complete and improved
+            return verified, verified, {
+                "evidence": "sleep_completed_and_fatigue_improved",
+                "activity_started": started,
+                "activity_complete": activity_complete,
+                "sleepiness_before": before_sleepiness,
+                "sleepiness_after": after_sleepiness,
+            }
         if action_name == "wait_one_turn":
             verified = outcome == "waited"
             return verified, verified, {"evidence": "waited_once", "outcome": outcome}
@@ -3106,7 +3351,11 @@ def append_log(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 def command_kwargs(choice: dict) -> dict:
-    return {k: choice[k] for k in ("dx", "dy", "item_name", "duration_minutes") if k in choice}
+    return {
+        k: choice[k]
+        for k in ("dx", "dy", "item_name", "item_type_id", "duration_minutes")
+        if k in choice
+    }
 
 def compact_state_for_hash(state: dict) -> dict:
     return {
@@ -4017,7 +4266,7 @@ def main() -> int:
             try:
                 obs = send_command("observe", timeout=900.0)
                 state = state_from_response(obs)
-                if action in {"eat_best_food", "drink_best"} and str(state.get("activity", "") or ""):
+                if action in {"eat_best_food", "drink_best", "sleep"} and str(state.get("activity", "") or ""):
                     post_activity_observe_retries = 1
                     obs = send_command("observe", timeout=900.0)
                     state = state_from_response(obs)
@@ -4054,7 +4303,7 @@ def main() -> int:
             )
             verification["post_activity_contract"] = (
                 str(state.get("activity", "") or "") == ""
-                if action in {"eat_best_food", "drink_best"}
+                if action in {"eat_best_food", "drink_best", "sleep"}
                 else None
             )
             verification["post_activity_observe_retries"] = post_activity_observe_retries
