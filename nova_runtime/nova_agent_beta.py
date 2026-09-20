@@ -429,6 +429,8 @@ class WorldModel:
     recent_actions: deque = field(default_factory=lambda: deque(maxlen=12))
     seen_hostiles: dict[str, dict] = field(default_factory=dict)
     blocked_edges: set[tuple[int, int, int, int, int, int]] = field(default_factory=set)
+    hazard_tiles: set[tuple[int, int, int]] = field(default_factory=set)
+    stall_avoid_tiles: set[tuple[int, int, int]] = field(default_factory=set)
     active_goal_id: str = ""
     active_intention: str = ""
     priority_context: dict = field(default_factory=dict)
@@ -446,19 +448,25 @@ class WorldModel:
             try:
                 gx = px + int(t["dx"])
                 gy = py + int(t["dy"])
-                self.known_tiles[(gx, gy, pz)] = {
+                tile_key = (gx, gy, pz)
+                self.known_tiles[tile_key] = {
                     "terrain": t.get("terrain", ""),
                     "passable": bool(t.get("passable")),
                     "openable": bool(t.get("openable")),
                     "swimmable": bool(t.get("swimmable")),
                     "deep_water": bool(t.get("deep_water")),
                     "dangerous": bool(t.get("dangerous")),
+                    "movement_hazard": bool(t.get("movement_hazard")),
+                    "special_movement": bool(t.get("special_movement")),
+                    "move_cost": int(t.get("move_cost", 0) or 0),
                     "items": list(t.get("items") or []),
                     "ground_consumables": [
                         dict(x) for x in (t.get("ground_consumables") or [])
                         if isinstance(x, dict)
                     ],
                 }
+                if bool(t.get("movement_hazard")) or bool(t.get("dangerous")) or bool(t.get("deep_water")):
+                    self.hazard_tiles.add(tile_key)
             except Exception:
                 pass
         for c in state.get("nearby_creatures", []):
@@ -473,8 +481,22 @@ class WorldModel:
         x, y, z = pos_tuple(state)
         return (x, y, z, x + dx, y + dy, z)
 
+    def target_key(self, state: dict, dx: int, dy: int) -> tuple[int, int, int]:
+        x, y, z = pos_tuple(state)
+        return (x + dx, y + dy, z)
+
     def is_known_blocked_edge(self, state: dict, dx: int, dy: int) -> bool:
         return self.edge_key(state, dx, dy) in self.blocked_edges
+
+    def is_known_hazard(self, state: dict, dx: int, dy: int) -> bool:
+        return self.target_key(state, dx, dy) in self.hazard_tiles
+
+    def refresh_stall_escape(self, state: dict) -> None:
+        current = pos_tuple(state)
+        if self.looping() or self.no_progress_streak >= 2:
+            self.stall_avoid_tiles.update(list(self.recent_positions)[-8:])
+        elif self.stall_avoid_tiles and current not in self.stall_avoid_tiles:
+            self.stall_avoid_tiles.clear()
 
     def record_action(self, state_before: dict, choice: dict, outcome: str,
                       result: dict | None = None) -> None:
@@ -486,9 +508,18 @@ class WorldModel:
         })
         if choice.get("action") == "move_one_tile" and outcome == "blocked":
             try:
-                self.blocked_edges.add(
-                    self.edge_key(state_before, int(choice.get("dx", 0)), int(choice.get("dy", 0)))
-                )
+                dx = int(choice.get("dx", 0))
+                dy = int(choice.get("dy", 0))
+                self.blocked_edges.add(self.edge_key(state_before, dx, dy))
+                error = str((result or {}).get("error") or "")
+                if (
+                    bool(choice.get("movement_hazard"))
+                    or bool(choice.get("dangerous"))
+                    or bool(choice.get("deep_water"))
+                    or "dangerous_tile" in error
+                    or "deep_water" in error
+                ):
+                    self.hazard_tiles.add(self.target_key(state_before, dx, dy))
             except Exception:
                 pass
 
@@ -633,6 +664,9 @@ def situation_summary(state: dict, wm: WorldModel) -> dict:
             "swimmable": bool(t.get("swimmable")),
             "deep_water": bool(t.get("deep_water")),
             "dangerous": bool(t.get("dangerous")),
+            "movement_hazard": bool(t.get("movement_hazard")),
+            "special_movement": bool(t.get("special_movement")),
+            "move_cost": int(t.get("move_cost", 0) or 0),
         })
 
     hostiles = []
@@ -1098,6 +1132,13 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["open_adjacent", "move_one_tile"],
             "priority": 0.76,
         })
+    if any(a.get("stall_escape") for a in actions):
+        candidates.append({
+            "goal_id": "escape_local_stall",
+            "intention": "leave the recently repeated local area using a safe route",
+            "supported_by": ["move_one_tile"],
+            "priority": 0.94,
+        })
     if any(a.get("action") == "move_one_tile" and int(a.get("visits_target", 0) or 0) == 0 for a in actions):
         candidates.append({
             "goal_id": "explore_frontier",
@@ -1159,6 +1200,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     tiles = tile_map(state)
     hostiles = hostile_positions(state)
     loop = wm.looping()
+    wm.refresh_stall_escape(state)
     visible_resources = visible_storable_consumables(state)
     known_resources = known_storable_consumables(state, wm)
 
@@ -1193,10 +1235,16 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
         backtrack = wm.is_immediate_backtrack(state, dx, dy)
 
         if t.get("passable"):
-            # Deep water and game-marked dangerous tiles are not ordinary
-            # exploration footsteps. They require a deliberate interaction
-            # policy that this validation runtime does not expose yet.
-            if bool(t.get("deep_water")) or bool(t.get("dangerous")):
+            # Hard safety floor: confirmed movement hazards are never ordinary
+            # frontier. This is generic, not water-specific: CDDA classifies
+            # dangerous terrain and Nova remembers those absolute tiles.
+            movement_hazard = (
+                bool(t.get("movement_hazard"))
+                or bool(t.get("deep_water"))
+                or bool(t.get("dangerous"))
+                or wm.is_known_hazard(state, dx, dy)
+            )
+            if movement_hazard:
                 continue
 
             # A native CDDA refusal is evidence. Do not hammer the same
@@ -1205,14 +1253,19 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 continue
 
             shallow_water = bool(t.get("swimmable"))
+            special_movement = bool(t.get("special_movement")) or shallow_water
+            move_cost = int(t.get("move_cost", 0) or 0)
             novelty = 1.0 / (1.0 + visits)
             score = 0.58 + 0.30 * novelty
+            if special_movement:
+                # Slow/special terrain (shallow water, rubble, etc.) remains
+                # traversable but does not count as attractive frontier merely
+                # because it is unvisited. Ordinary dry/easy ground wins first.
+                score -= 0.30
             if shallow_water:
-                # Shallow water is traversable, but it should not attract the
-                # frontier walker merely because it is unvisited. Prefer dry
-                # ground and use shallow water only when it is genuinely the
-                # remaining route.
-                score -= 0.45
+                score -= 0.20
+            if move_cost > 2:
+                score -= min(0.20, 0.03 * (move_cost - 2))
             resource_distance_delta = 0
             nearest_resource = None
             if known_resources:
@@ -1250,7 +1303,11 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "swimmable": shallow_water,
                 "deep_water": bool(t.get("deep_water")),
                 "dangerous": bool(t.get("dangerous")),
-                "navigation_rank": 1 if shallow_water else 0,
+                "movement_hazard": movement_hazard,
+                "special_movement": special_movement,
+                "move_cost": move_cost,
+                "navigation_rank": 2 if shallow_water else (1 if special_movement else 0),
+                "stall_recent_target": wm.target_key(state, dx, dy) in wm.stall_avoid_tiles,
                 "visits_target": visits,
                 "immediate_backtrack": backtrack,
                 "hostile_on_tile": (dx, dy) in hostiles,
@@ -1259,6 +1316,34 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "controller_score": max(0.0, min(1.0, score)),
                 "progress": progress,
             })
+
+    # Generic stall breaker. If Nova has been pacing or making no net
+    # progress, and at least one safe move exits the recent local cluster,
+    # remove the old-cluster moves from this decision cycle. This makes
+    # "abandon plan" actually reroute instead of immediately retrying the
+    # same shoreline/corner from another angle.
+    move_actions = [a for a in actions if a.get("action") == "move_one_tile"]
+    if wm.stall_avoid_tiles and move_actions:
+        escape_moves = [a for a in move_actions if not a.get("stall_recent_target")]
+        if escape_moves:
+            escape_keys = {
+                (int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0))
+                for a in escape_moves
+            }
+            filtered = []
+            for action in actions:
+                if action.get("action") != "move_one_tile":
+                    filtered.append(action)
+                    continue
+                key = (int(action.get("dx", 0) or 0), int(action.get("dy", 0) or 0))
+                if key in escape_keys:
+                    item = dict(action)
+                    item["stall_escape"] = True
+                    item["controller_score"] = min(
+                        1.0, float(item.get("controller_score", 0.0)) + 0.20
+                    )
+                    filtered.append(item)
+            actions = filtered
 
     # Validation sub-batch: pickup + eat + drink only.  Pickup is exposed
     # only for real nearby comestibles that the bridge identified.
@@ -1673,6 +1758,12 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
             kind="interact",
             params={"action": "wait_one_turn"},
             completion={"type": "waited_once"},
+        ))
+    elif goal_id == "escape_local_stall":
+        steps.append(PlanStep(
+            kind="explore",
+            params={"max_successful_moves": 8, "successful_moves": 0},
+            completion={"type": "explore_budget"},
         ))
     else:
         steps.append(PlanStep(
@@ -2868,6 +2959,8 @@ def main() -> int:
                     "known_tiles": len(wm.known_tiles),
                     "loop_detected": wm.looping(),
                     "known_blocked_edges": len(wm.blocked_edges),
+            "known_hazard_tiles": len(wm.hazard_tiles),
+            "stall_escape_active": bool(wm.stall_avoid_tiles),
                 },
             })
     
