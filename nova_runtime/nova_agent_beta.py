@@ -59,6 +59,7 @@ VALIDATION_DISPATCH_ALLOWLIST = {
     "open_adjacent",
     "wait_one_turn",
     "pickup_consumable",
+    "pickup_item",
     "eat_best_food",
     "drink_best",
 }
@@ -1236,6 +1237,9 @@ def apply_priority_ladder(state: dict, actions: list[dict]) -> tuple[list[dict],
         if name == "pickup_consumable":
             score += 0.08
             item.setdefault("priority_boost", "resource_scouting")
+        elif name == "pickup_item":
+            score += 0.04
+            item.setdefault("priority_boost", "visible_item_opportunity")
         elif name == "move_one_tile" and int(item.get("visits_target", 0) or 0) == 0:
             score += 0.05
             item.setdefault("priority_boost", "exploration")
@@ -1298,16 +1302,27 @@ def known_storable_consumables(state: dict, wm: WorldModel | None) -> list[dict]
     return found
 
 def capability_gap_summary(state: dict) -> str:
-    visible_nonconsumables = []
+    unsafe_generic_items = []
+    missing_generic_metadata = []
     fixture_names = []
     for tile in state.get("local_tiles", []):
-        if tile.get("items") and not tile.get("ground_consumables"):
-            visible_nonconsumables.extend(str(x) for x in tile.get("items", [])[:3])
+        ground_items = tile.get("ground_items")
+        if isinstance(ground_items, list):
+            for item in ground_items[:3]:
+                if not isinstance(item, dict) or bool(item.get("consumable")):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if name and not bool(item.get("storable_without_wield", False)):
+                    unsafe_generic_items.append(name)
+        elif tile.get("items") and not tile.get("ground_consumables"):
+            missing_generic_metadata.extend(str(x) for x in tile.get("items", [])[:3])
         terrain = str(tile.get("terrain", "")).lower()
         if any(name in terrain for name in ("sink", "toilet", "shower")):
             fixture_names.append(terrain)
-    if visible_nonconsumables:
-        return "generic item pickup is not exposed yet; visible items cannot be collected unless they are consumables"
+    if unsafe_generic_items:
+        return "some visible items require inventory/equipment decisions before they can be stored safely"
+    if missing_generic_metadata:
+        return "generic pickup metadata is unavailable; update the native bridge and controller together"
     if fixture_names and int(state.get("thirst", 0) or 0) >= DRINK_NEED_THIRST:
         return "environmental water interaction is not exposed yet"
     return "none detected in the current local state"
@@ -1566,6 +1581,26 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["pickup_consumable"],
             "priority": 0.88,
         })
+
+    generic_pickups = [a for a in actions if a.get("action") == "pickup_item"]
+    generic_pickups.sort(key=lambda a: (
+        -float(a.get("controller_score", 0.0)),
+        stable_direction_rank(int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0)),
+        str(a.get("item_name", "")),
+    ))
+    for index, pickup in enumerate(generic_pickups[:5]):
+        name = str(pickup.get("item_name", "")).strip() or "visible item"
+        candidates.append({
+            "goal_id": f"acquire_visible_item_{index}",
+            "intention": f"pick up the visible {name} if it plausibly improves survival utility",
+            "supported_by": ["pickup_item"],
+            "priority": 0.72,
+            "target": {
+                "dx": int(pickup.get("dx", 0) or 0),
+                "dy": int(pickup.get("dy", 0) or 0),
+                "name": name,
+            },
+        })
     if "open_adjacent" in action_names:
         candidates.append({
             "goal_id": "open_boundary",
@@ -1593,7 +1628,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             candidates.append({
                 "goal_id": "search_shelter_supplies",
                 "intention": f"systematically inspect the secured shelter near {interior_target.get('terrain') or 'an unvisited interior area'} for useful supplies",
-                "supported_by": ["move_one_tile", "pickup_consumable", "open_adjacent"],
+                "supported_by": ["move_one_tile", "pickup_consumable", "pickup_item", "open_adjacent"],
                 "priority": 0.90,
                 "target": interior_target,
                 "mission_phase": phase,
@@ -1698,7 +1733,13 @@ def choose_fallback_goal(candidates: list[dict]) -> dict:
     return max(candidates, key=lambda g: float(g.get("priority", 0.0)))
 
 def goal_still_supported(wm: WorldModel, actions: list[dict], state: dict) -> bool:
-    if not wm.active_goal_id:
+    persistent_goals = {
+        "search_for_shelter",
+        "search_shelter_supplies",
+        "leave_shoreline",
+        "break_exploration_stall",
+    }
+    if not wm.active_goal_id or wm.active_goal_id not in persistent_goals:
         return False
     for goal in goal_candidates(state, actions, wm):
         if goal.get("goal_id") == wm.active_goal_id:
@@ -1904,8 +1945,9 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                     filtered.append(item)
             actions = filtered
 
-    # Validation sub-batch: pickup + eat + drink only.  Pickup is exposed
-    # only for real nearby comestibles that the bridge identified.
+    # Nearby pickup actions never open a human-facing inventory/disposal UI.
+    # The native bridge exposes whether an item fits existing storage, so both
+    # consumables and generic items remain strict, verifiable actions.
     for (dx, dy), t in tiles.items():
         if abs(dx) > 1 or abs(dy) > 1:
             continue
@@ -1914,8 +1956,6 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
             if not name:
                 continue
             if not bool(food.get("storable_without_wield", False)):
-                # This validation action means "store in inventory", not
-                # "wield it because no pocket fits" and never "open a menu".
                 continue
             nutrition = int(food.get("nutrition", 0) or 0)
             quench = int(food.get("quench", 0) or 0)
@@ -1931,6 +1971,23 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "progress": "acquires food/drink resource",
                 "nutrition": nutrition,
                 "quench": quench,
+            })
+        for ground_item in (t.get("ground_items") or [])[:3]:
+            if not isinstance(ground_item, dict):
+                continue
+            if bool(ground_item.get("consumable")):
+                continue
+            if not bool(ground_item.get("storable_without_wield", False)):
+                continue
+            name = str(ground_item.get("name", "")).strip()
+            if not name:
+                continue
+            actions.append({
+                "action": "pickup_item", "dx": dx, "dy": dy, "item_name": name,
+                "label": f"pick up {name}",
+                "controller_score": 0.52,
+                "progress": "acquires a visible non-consumable item",
+                "generic_item": True,
             })
 
     consumables = state.get("inventory_consumables", [])
@@ -1973,8 +2030,8 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     return actions
 
 def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> bool:
-    # Qwen is for judgment, not footsteps. Empty, repetitive traversal should
-    # stay fast until something appears that can materially change the choice.
+    # Qwen is for judgment, not footsteps. False means deterministic goal
+    # selection from goal_candidates(); it must never bypass goal formation.
     if wm.shoreline_escape_active or wm.strategic_stall_active:
         return True
     if state.get("strategic_landmarks"):
@@ -1986,7 +2043,7 @@ def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> boo
         return True
     if any(t.get("openable") for t in state.get("local_tiles", [])):
         return True
-    if any(a.get("action") in {"pickup_consumable", "eat_best_food", "drink_best"}
+    if any(a.get("action") in {"pickup_consumable", "pickup_item", "eat_best_food", "drink_best"}
            for a in actions):
         return True
     if any(a.get("lesson_bias") or a.get("threat_response") or a.get("shelter_preference")
@@ -2130,7 +2187,7 @@ def select_interaction(actions: list[dict], action_name: str,
     candidates = [a for a in actions if a.get("action") == action_name]
     if item_name:
         candidates = [a for a in candidates if a.get("item_name") == item_name]
-    if target and state and action_name in {"pickup_consumable", "open_adjacent"}:
+    if target and state and action_name in {"pickup_consumable", "pickup_item", "open_adjacent"}:
         x, y, _ = pos_tuple(state)
         tx = int(target.get("x", x))
         ty = int(target.get("y", y))
@@ -2367,6 +2424,19 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
                 params={"action": "pickup_consumable", "item_name": p.get("item_name")},
                 completion={"type": "pickup_verified", "item_name": p.get("item_name")},
             ))
+    elif goal_id.startswith("acquire_visible_item_"):
+        target = dict(goal.get("target") or {})
+        if target:
+            steps.append(PlanStep(
+                kind="interact",
+                target=absolute_target_from_relative(
+                    state,
+                    int(target.get("dx", 0) or 0),
+                    int(target.get("dy", 0) or 0),
+                ),
+                params={"action": "pickup_item", "item_name": target.get("name")},
+                completion={"type": "pickup_verified", "item_name": target.get("name")},
+            ))
     elif goal_id == "open_boundary":
         doors = [a for a in actions if a.get("action") == "open_adjacent"]
         if doors:
@@ -2483,6 +2553,7 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
         "The priority_ladder has already filtered or biased the action space; respect it. "
         "When lesson_bias appears, treat it as evidence from a previous real death and prefer a different feasible choice when reasonable. "
         "Use measured needs and feasible affordances only. "
+        "For acquire_visible_item candidates, choose an item only when its name plausibly improves survival; ignore obvious junk. "
         "Do not invent goals or actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
         "Also provide brief user-facing telemetry. This is not hidden chain-of-thought; it is an explicit concise thought summary for the operator. "
@@ -2558,6 +2629,15 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
         return "shoreline_cleared"
     if plan.goal_id in {"search_for_shelter", "explore_frontier"} and state.get("strategic_landmarks"):
         return "strategic_landmark_spotted"
+    if plan.provenance != "qwen_plan":
+        if plan.goal_id in {"search_for_shelter", "explore_frontier"} and any(
+            a.get("action") == "pickup_consumable" for a in actions
+        ):
+            return "consumable_opportunity_spotted"
+        if plan.goal_id == "search_shelter_supplies" and any(
+            a.get("action") in {"pickup_consumable", "pickup_item"} for a in actions
+        ):
+            return "supply_opportunity_spotted"
     if plan.goal_id == "break_exploration_stall" and not wm.strategic_stall_active:
         return "strategic_stall_cleared"
 
@@ -2672,11 +2752,12 @@ def verify_step(plan: Plan, action: dict, outcome: str, before: dict,
 
     if step.kind == "interact":
         action_name = step.params.get("action")
-        if action_name == "pickup_consumable":
+        if action_name in {"pickup_consumable", "pickup_item"}:
             verified = outcome == "pickup_verified"
             return verified, verified, {
                 "evidence": "native_pickup_verified",
                 "item_name": step.params.get("item_name"),
+                "pickup_action": action_name,
                 "outcome": outcome,
             }
         if action_name == "open_adjacent":
@@ -3401,16 +3482,62 @@ def main() -> int:
             dashboard.update(state, wm, plan, matched_lessons)
     
             if plan and plan.completed:
+                completed_plan = plan
                 append_log(log_path, {
                     "wall_time": utc_now(),
                     "plan_event": "completed",
-                    "plan": plan.to_dict(),
+                    "plan": completed_plan.to_dict(),
                     "position": state.get("position"),
                 })
-                feed.push("PLAN: completed " + plan.goal_id)
-                plan = None
-                wm.active_goal_id = ""
-                wm.active_intention = ""
+                feed.push("PLAN: completed " + completed_plan.goal_id)
+
+                immediate_reassessment = bool(safety) or any(
+                    a.get("action") in {
+                        "pickup_consumable", "pickup_item", "eat_best_food", "drink_best"
+                    }
+                    for a in actions
+                )
+                continuation_goal = None
+                if not immediate_reassessment and goal_still_supported(wm, actions, state):
+                    supported_goals = [
+                        goal for goal in goal_candidates(state, actions, wm)
+                        if goal.get("goal_id") == wm.active_goal_id
+                    ]
+                    if supported_goals:
+                        continuation_goal = choose_fallback_goal(supported_goals)
+
+                if continuation_goal is not None:
+                    plan = synthesize_plan_from_goal(
+                        continuation_goal,
+                        state,
+                        wm,
+                        actions,
+                        planner_reason="persistent intention: current survival goal remains supported",
+                        provenance="goal_commitment",
+                    )
+                    wm.active_goal_id = plan.goal_id
+                    wm.active_intention = plan.intention
+                    wm.last_planner_reason = plan.planner_reason
+                    wm.last_thought_summary = (
+                        f"I am continuing {plan.goal_id} because the goal is still unfinished."
+                    )
+                    wm.last_thought_considering = (
+                        "stay committed unless danger, needs, or a concrete resource opportunity supersedes it"
+                    )
+                    wm.last_thought_uncertainty = "none"
+                    append_log(log_path, {
+                        "wall_time": utc_now(),
+                        "plan_event": "continued",
+                        "previous_plan": completed_plan.to_dict(),
+                        "plan": plan.to_dict(),
+                        "position": state.get("position"),
+                    })
+                    feed.push("INTENT: continuing " + plan.intention)
+                    dashboard.update(state, wm, plan, matched_lessons)
+                else:
+                    plan = None
+                    wm.active_goal_id = ""
+                    wm.active_intention = ""
                 continue
     
             if plan:
@@ -3436,9 +3563,7 @@ def main() -> int:
     
                 if safety:
                     plan = safety_plan(state, actions, safety)
-                elif not needs_qwen_judgment(state, wm, actions):
-                    plan = fast_frontier_plan(state, actions)
-                elif model:
+                elif model and needs_qwen_judgment(state, wm, actions):
                     try:
                         plan, model_latency_seconds, model_metrics, _ = qwen_plan(
                             model, state, wm, actions, model_trace_path
@@ -3447,7 +3572,12 @@ def main() -> int:
                         model_error = repr(exc)
                         plan = fallback_plan(state, wm, actions, reason=f"planner error: {model_error}")
                 else:
-                    plan = fallback_plan(state, wm, actions)
+                    plan = fallback_plan(
+                        state,
+                        wm,
+                        actions,
+                        reason="deterministic goal formation: no Qwen judgment required",
+                    )
     
                 wm.active_goal_id = plan.goal_id
                 wm.active_intention = plan.intention
