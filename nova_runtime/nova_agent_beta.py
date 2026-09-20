@@ -15,8 +15,8 @@ from urllib import request
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 BRIDGE = Path(os.environ.get("NOVA_BRIDGE_DIR", ROOT / "nova-ipc"))
-LOG_DIR = ROOT / "nova-logs"
-STATE_DIR = ROOT / "nova-state"
+LOG_DIR = Path(os.environ.get("NOVA_LOG_DIR", ROOT / "nova-logs"))
+STATE_DIR = Path(os.environ.get("NOVA_STATE_DIR", ROOT / "nova-state"))
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 RUN_MINUTES = int(os.environ.get("NOVA_RUN_MINUTES", "60"))
 MODEL_OVERRIDE = os.environ.get("NOVA_MODEL", "").strip()
@@ -3839,6 +3839,36 @@ def log_life_started(log_path: Path, life: LifeTelemetry, resumed: bool) -> None
         f"| previous dead lives: {len(previous)}"
     )
 
+def publish_lesson_signal(wm: WorldModel, matched_lessons: list[dict],
+                          feed: ThoughtFeed, log_path: Path,
+                          life: LifeTelemetry, priority_context: dict,
+                          state: dict) -> bool:
+    lesson_signature = "|".join(
+        sorted(str(m.get("lesson_id")) for m in matched_lessons if m.get("lesson_id"))
+    )
+    if lesson_signature == wm.last_lesson_signature:
+        return False
+    wm.last_lesson_signature = lesson_signature
+    if not matched_lessons:
+        return False
+
+    first = matched_lessons[0]
+    memory_line = (
+        f"MEMORY: biasing away from {first.get('at_death_action')} — "
+        "similar conditions killed me before."
+    )
+    feed.push(memory_line)
+    append_log(log_path, {
+        "wall_time": utc_now(),
+        "session_event": "lesson_fired",
+        "life_id": life.life_id,
+        "life_number": life.life_number,
+        "priority_context": priority_context,
+        "matches": matched_lessons,
+        "current_conditions": lesson_conditions(state),
+    })
+    return True
+
 def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -3997,27 +4027,10 @@ def main() -> int:
             wm.priority_context = priority_context
             safety = deterministic_safety(state, actions)
 
-            lesson_signature = "|".join(
-                sorted(str(m.get("lesson_id")) for m in matched_lessons if m.get("lesson_id"))
+            publish_lesson_signal(
+                wm, matched_lessons, feed, log_path,
+                life, priority_context, state
             )
-            if lesson_signature != wm.last_lesson_signature:
-                wm.last_lesson_signature = lesson_signature
-                if matched_lessons:
-                    first = matched_lessons[0]
-                    memory_line = (
-                        f"MEMORY: biasing away from {first.get('at_death_action')} — "
-                        "similar conditions killed me before."
-                    )
-                    feed.push(memory_line)
-                    append_log(log_path, {
-                        "wall_time": utc_now(),
-                        "session_event": "lesson_fired",
-                        "life_id": life.life_id,
-                        "life_number": life.life_number,
-                        "priority_context": priority_context,
-                        "matches": matched_lessons,
-                        "current_conditions": lesson_conditions(state),
-                    })
 
             feed.push("SEE: " + describe_situation(sit))
             dashboard.update(state, wm, plan, matched_lessons)
