@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib import request
 
 ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ROOT.parent
 BRIDGE = Path(os.environ.get("NOVA_BRIDGE_DIR", ROOT / "nova-ipc"))
 LOG_DIR = ROOT / "nova-logs"
 STATE_DIR = ROOT / "nova-state"
@@ -30,6 +31,7 @@ LIFE_HISTORY_PATH = STATE_DIR / "nova-life-history-v1.jsonl"
 LESSON_PATH = STATE_DIR / "nova-lessons-v1.jsonl"
 ACTIVE_LIFE_PATH = STATE_DIR / "nova-active-life-v1.json"
 CONSUMED_LIFE_STATUS_PATH = STATE_DIR / "nova-consumed-life-status-v1.json"
+PAUSE_FLAG_PATH = BRIDGE / "nova-pause.flag"
 
 CARDINALS = {
     "north": (0, -1),
@@ -114,6 +116,28 @@ def write_text_atomic(path: Path, text: str) -> None:
 
 def write_json_atomic(path: Path, obj: dict) -> None:
     write_text_atomic(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+
+def ensure_operator_helpers() -> None:
+    pause_cmd = PROJECT_ROOT / "PAUSE_NOVA.cmd"
+    resume_cmd = PROJECT_ROOT / "RESUME_NOVA.cmd"
+    bridge_flag = str(PAUSE_FLAG_PATH)
+    pause_text = (
+        "@echo off\r\n"
+        f"echo pause>\"{bridge_flag}\"\r\n"
+        "echo Nova pause requested. Wait for NOVA PAUSED before using CDDA menus.\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+    )
+    resume_text = (
+        "@echo off\r\n"
+        f"del /q \"{bridge_flag}\" 2>nul\r\n"
+        "echo Nova resume requested.\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+    )
+    try:
+        write_text_atomic(pause_cmd, pause_text)
+        write_text_atomic(resume_cmd, resume_text)
+    except OSError:
+        pass
 
 class LifeEnded(RuntimeError):
     def __init__(self, status: dict):
@@ -453,6 +477,10 @@ class WorldModel:
     last_planner_assessment: str = ""
     last_planner_blocker: str = ""
     last_planner_next_step: str = ""
+    last_planner_reason: str = ""
+    last_thought_summary: str = ""
+    last_thought_considering: str = ""
+    last_thought_uncertainty: str = ""
     last_action_summary: str = ""
     active_goal_id: str = ""
     active_intention: str = ""
@@ -756,6 +784,7 @@ class DashboardFeed:
     def __init__(self) -> None:
         self.mission_path = BRIDGE / "nova-mission.txt"
         self.mind_path = BRIDGE / "nova-mind.txt"
+        self.thoughts_path = BRIDGE / "nova-thought-summary.txt"
         self.status_path = BRIDGE / "nova-status.txt"
 
     @staticmethod
@@ -791,6 +820,13 @@ class DashboardFeed:
             f"BLOCKER: {self._clean(blocker or wm.last_planner_blocker or 'none', 150)}",
             f"PLAN STEP: {self._clean(step, 120)}",
         ]
+        thought_lines = [
+            f"THOUGHT: {self._clean(wm.last_thought_summary or intention, 160)}",
+            f"WHY: {self._clean(wm.last_planner_reason or 'following the current survival plan', 160)}",
+            f"CONSIDERING: {self._clean(wm.last_thought_considering or 'current committed plan', 160)}",
+            f"UNCERTAIN: {self._clean(wm.last_thought_uncertainty or 'none stated', 160)}",
+            f"LIMIT: {self._clean(capability_gap_summary(state), 160)}",
+        ]
         hostiles = [
             c for c in state.get("nearby_creatures", [])
             if str(c.get("attitude", "")).lower() == "hostile"
@@ -807,6 +843,7 @@ class DashboardFeed:
         try:
             write_text_atomic(self.mission_path, "\n".join(mission_lines) + "\n")
             write_text_atomic(self.mind_path, "\n".join(mind_lines) + "\n")
+            write_text_atomic(self.thoughts_path, "\n".join(thought_lines) + "\n")
             write_text_atomic(self.status_path, "\n".join(status_lines) + "\n")
         except OSError:
             pass
@@ -1260,6 +1297,67 @@ def known_storable_consumables(state: dict, wm: WorldModel | None) -> list[dict]
             })
     return found
 
+def capability_gap_summary(state: dict) -> str:
+    visible_nonconsumables = []
+    fixture_names = []
+    for tile in state.get("local_tiles", []):
+        if tile.get("items") and not tile.get("ground_consumables"):
+            visible_nonconsumables.extend(str(x) for x in tile.get("items", [])[:3])
+        terrain = str(tile.get("terrain", "")).lower()
+        if any(name in terrain for name in ("sink", "toilet", "shower")):
+            fixture_names.append(terrain)
+    if visible_nonconsumables:
+        return "generic item pickup is not exposed yet; visible items cannot be collected unless they are consumables"
+    if fixture_names and int(state.get("thirst", 0) or 0) >= DRINK_NEED_THIRST:
+        return "environmental water interaction is not exposed yet"
+    return "none detected in the current local state"
+
+def known_unvisited_indoor_target(state: dict, wm: WorldModel | None) -> dict | None:
+    if wm is None:
+        return None
+    px, py, pz = pos_tuple(state)
+    candidates = []
+    seen = set()
+    for (gx, gy, gz), tile in wm.known_tiles.items():
+        if gz != pz or not bool(tile.get("indoors")) or not bool(tile.get("passable")):
+            continue
+        key = (gx, gy, gz)
+        if key == (px, py, pz) or int(wm.visits.get(key, 0) or 0) > 0:
+            continue
+        if bool(tile.get("movement_hazard")) or bool(tile.get("dangerous")) or bool(tile.get("deep_water")):
+            continue
+        distance = max(abs(gx - px), abs(gy - py))
+        if distance <= 0 or distance > 32:
+            continue
+        seen.add(key)
+        candidates.append((distance, 0, {
+            "gx": gx, "gy": gy, "gz": gz,
+            "distance": distance,
+            "terrain": str(tile.get("terrain", "")),
+            "kind": "interior_search",
+        }))
+    for (gx, gy, gz), landmark in wm.known_landmarks.items():
+        key = (gx, gy, gz)
+        if key in seen or gz != pz or key in wm.failed_landmarks:
+            continue
+        if str(landmark.get("kind", "")) == "shelter_entrance":
+            continue
+        if int(wm.visits.get(key, 0) or 0) > 0:
+            continue
+        distance = max(abs(gx - px), abs(gy - py))
+        if distance <= 0 or distance > 32:
+            continue
+        candidates.append((distance, 1, {
+            "gx": gx, "gy": gy, "gz": gz,
+            "distance": distance,
+            "terrain": str(landmark.get("terrain", "")),
+            "kind": "interior_search",
+        }))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1]))
+    return candidates[0][2]
+
 def known_structure_targets(state: dict, wm: WorldModel | None) -> list[dict]:
     if wm is None:
         return []
@@ -1408,7 +1506,9 @@ def mission_phase(state: dict, wm: WorldModel | None) -> str:
     if int(needs.get("hunger", 0) or 0) >= CRITICAL_NEED_THRESHOLD:
         return "solve_critical_hunger"
     if bool(state.get("indoors")):
-        return "shelter_secured_maintain_supplies"
+        if known_unvisited_indoor_target(state, wm) is not None:
+            return "shelter_secured_search_supplies"
+        return "shelter_secured_reassess"
     if known_structure_targets(state, wm):
         return "reach_known_shelter"
     return "search_for_shelter"
@@ -1487,8 +1587,20 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "mission_phase": phase,
         }]
 
+    if bool(state.get("indoors")) and "move_one_tile" in action_names:
+        interior_target = known_unvisited_indoor_target(state, wm)
+        if interior_target is not None:
+            candidates.append({
+                "goal_id": "search_shelter_supplies",
+                "intention": f"systematically inspect the secured shelter near {interior_target.get('terrain') or 'an unvisited interior area'} for useful supplies",
+                "supported_by": ["move_one_tile", "pickup_consumable", "open_adjacent"],
+                "priority": 0.90,
+                "target": interior_target,
+                "mission_phase": phase,
+            })
+
     navigation_judgment = []
-    if any(a.get("navigation_override") == "leave_shoreline" for a in actions):
+    if not bool(state.get("indoors")) and any(a.get("navigation_override") == "leave_shoreline" for a in actions):
         navigation_judgment.append({
             "goal_id": "leave_shoreline",
             "intention": "move inland because recent exploration has stayed too close to the shoreline",
@@ -1497,7 +1609,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "navigation_override": True,
         })
 
-    if known_structures and "move_one_tile" in action_names:
+    if not bool(state.get("indoors")) and known_structures and "move_one_tile" in action_names:
         target = known_structures[0]
         navigation_judgment.append({
             "goal_id": "approach_known_structure",
@@ -1507,7 +1619,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "target": target,
         })
 
-    if wm and wm.strategic_stall_active and "move_one_tile" in action_names:
+    if wm and not bool(state.get("indoors")) and wm.strategic_stall_active and "move_one_tile" in action_names:
         escape_target = known_escape_target(state, wm)
         navigation_judgment.append({
             "goal_id": "break_exploration_stall",
@@ -1518,7 +1630,7 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "strategic_stall": strategic_progress_summary(wm),
         })
 
-    if wm and (wm.strategic_stall_active or wm.shoreline_escape_active) and navigation_judgment:
+    if wm and not bool(state.get("indoors")) and (wm.strategic_stall_active or wm.shoreline_escape_active) and navigation_judgment:
         return navigation_judgment
 
     if any(a.get("stall_escape") for a in actions):
@@ -1995,6 +2107,16 @@ def plan_step_complete_before_action(step: PlanStep, state: dict) -> bool:
         tz = int(step.target.get("z", z))
         radius = int(step.params.get("arrival_radius", 0) or 0)
         return z == tz and max(abs(tx - x), abs(ty - y)) <= radius
+    if step.kind == "interact" and step.target and str(step.params.get("action", "")) == "open_adjacent":
+        x, y, z = pos_tuple(state)
+        tx = int(step.target.get("x", x))
+        ty = int(step.target.get("y", y))
+        tz = int(step.target.get("z", z))
+        dx, dy = tx - x, ty - y
+        if z == tz and abs(dx) <= 1 and abs(dy) <= 1:
+            tile = tile_map(state).get((dx, dy))
+            if tile and bool(tile.get("passable")) and bool(tile.get("closable")):
+                return True
     if step.kind == "rest":
         stamina = int(state.get("stamina", 0) or 0)
         stamina_max = max(1, int(state.get("stamina_max", 1) or 1))
@@ -2294,6 +2416,19 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
             params={"max_successful_moves": 32, "successful_moves": 0},
             completion={"type": "explore_budget"},
         ))
+    elif goal_id == "search_shelter_supplies":
+        target = dict(goal.get("target") or {})
+        if target:
+            steps.append(PlanStep(
+                kind="go_to",
+                target={
+                    "x": int(target.get("gx", pos_tuple(state)[0])),
+                    "y": int(target.get("gy", pos_tuple(state)[1])),
+                    "z": int(target.get("gz", pos_tuple(state)[2])),
+                },
+                params={"arrival_radius": 0},
+                completion={"type": "inspect_interior"},
+            ))
     else:
         steps.append(PlanStep(
             kind="explore",
@@ -2350,8 +2485,8 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
         "Use measured needs and feasible affordances only. "
         "Do not invent goals or actions. "
         "Return concise JSON only; do not narrate hidden chain-of-thought. "
-        "Also provide brief user-facing telemetry: assessment, blocker, and next_step. "
-        'Schema: {"goal_id":"exact candidate id","intention":"short purpose","reason":"one short evidence-grounded reason","assessment":"one sentence about the situation","blocker":"one short blocker or none","next_step":"one short next step"}.'
+        "Also provide brief user-facing telemetry. This is not hidden chain-of-thought; it is an explicit concise thought summary for the operator. "
+        'Schema: {"goal_id":"exact candidate id","intention":"short purpose","reason":"one short evidence-grounded reason","assessment":"one sentence about the situation","blocker":"one short blocker or none","next_step":"one short next step","thought_summary":"one sentence describing what Nova is focusing on","considering":"short alternatives or priorities being weighed","uncertainty":"one short uncertainty or none"}.'
     )
     payload = {
         "model": model,
@@ -2378,6 +2513,10 @@ def qwen_plan(model: str, state: dict, wm: WorldModel, actions: list[dict],
     wm.last_planner_assessment = str(parsed.get("assessment", "")).strip()[:240]
     wm.last_planner_blocker = str(parsed.get("blocker", "")).strip()[:180]
     wm.last_planner_next_step = str(parsed.get("next_step", "")).strip()[:180]
+    wm.last_planner_reason = reason[:240]
+    wm.last_thought_summary = str(parsed.get("thought_summary", "")).strip()[:240]
+    wm.last_thought_considering = str(parsed.get("considering", "")).strip()[:220]
+    wm.last_thought_uncertainty = str(parsed.get("uncertainty", "")).strip()[:180]
     if intention:
         chosen = dict(chosen)
         chosen["intention"] = intention
@@ -2419,10 +2558,6 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
         return "shoreline_cleared"
     if plan.goal_id in {"search_for_shelter", "explore_frontier"} and state.get("strategic_landmarks"):
         return "strategic_landmark_spotted"
-    if plan.goal_id == "approach_known_structure" and any(
-        a.get("action") == "open_adjacent" for a in actions
-    ):
-        return "structure_boundary_reached"
     if plan.goal_id == "break_exploration_stall" and not wm.strategic_stall_active:
         return "strategic_stall_cleared"
 
@@ -3086,6 +3221,7 @@ def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     BRIDGE.mkdir(parents=True, exist_ok=True)
+    ensure_operator_helpers()
 
     model = pick_model()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -3208,11 +3344,30 @@ def main() -> int:
     deadline = None if RUN_MINUTES <= 0 else time.monotonic() + RUN_MINUTES * 60
     action_count = 0
     plan: Plan | None = None
+    operator_paused = False
 
     abort_reason = "validation_window_ended"
     transport_failure: dict | None = None
     try:
         while deadline is None or time.monotonic() < deadline:
+            if PAUSE_FLAG_PATH.exists():
+                if not operator_paused:
+                    operator_paused = True
+                    wm.last_planner_blocker = "operator pause requested"
+                    wm.last_thought_summary = "I am paused so the operator can use CDDA menus safely."
+                    print("NOVA PAUSED — safe to use CDDA menus, save, or quit.")
+                    feed.push("PAUSED: operator control; no Nova actions will be sent.")
+                    dashboard.update(state, wm, plan, blocker="operator pause requested")
+                while PAUSE_FLAG_PATH.exists():
+                    time.sleep(0.10)
+                print("NOVA RESUMED — refreshing game state.")
+                feed.push("RESUMED: refreshing CDDA state before acting.")
+                obs = send_command("observe", timeout=30.0)
+                state = state_from_response(obs)
+                wm.observe(state)
+                operator_paused = False
+                continue
+
             sit = situation_summary(state, wm)
             actions = available_actions(state, wm)
             actions, priority_context = apply_priority_ladder(state, actions)
@@ -3296,6 +3451,11 @@ def main() -> int:
     
                 wm.active_goal_id = plan.goal_id
                 wm.active_intention = plan.intention
+                if plan.provenance != "qwen_plan":
+                    wm.last_planner_reason = plan.planner_reason
+                    wm.last_thought_summary = f"I am following {plan.goal_id}: {plan.intention}"
+                    wm.last_thought_considering = "deterministic execution; Qwen judgment is not required for this step"
+                    wm.last_thought_uncertainty = "none"
                 append_log(log_path, {
                     "wall_time": utc_now(),
                     "plan_event": "created",
