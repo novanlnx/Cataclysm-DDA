@@ -23,7 +23,8 @@ jobs:
       - name: Validate Nova Python tools
         shell: pwsh
         run: |
-          python -m py_compile nova_runtime\nova_agent_beta.py nova_runtime\nova_life_log.py
+          python -m py_compile nova_runtime\nova_agent_beta.py nova_runtime\nova_life_log.py nova_runtime\nova_validation.py
+          python nova_runtime\nova_validation.py --self-test
           $env:NOVA_STATE_DIR="$PWD\.tmp-nova-empty-state"
           Remove-Item $env:NOVA_STATE_DIR -Recurse -Force -ErrorAction SilentlyContinue
           python nova_runtime\nova_life_log.py
@@ -57,5 +58,11 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nova-cdda-survival-core-validation-windows-x64
-          path: cataclysm-tiles.exe
+          path: |
+            cataclysm-tiles.exe
+            nova_runtime/nova_agent_beta.py
+            nova_runtime/nova_life_log.py
+            nova_runtime/nova_validation.py
+            START_NOVA_VALIDATION.cmd
+            RUN_NOVA_DEATH_VALIDATION.cmd
           if-no-files-found: error
