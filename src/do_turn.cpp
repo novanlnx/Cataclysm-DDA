@@ -123,8 +123,19 @@ namespace nova_bridge
 
 namespace fs = std::filesystem;
 
-static constexpr const char *protocol_version = "nova-cdda-bridge-v4-evolution";
+static constexpr const char *protocol_version = "nova-cdda-bridge-v5-validation";
 static constexpr int life_status_schema_version = 1;
+
+static bool validation_mode_enabled()
+{
+    const char *raw = std::getenv( "NOVA_VALIDATION_MODE" );
+    if( raw == nullptr ) {
+        return false;
+    }
+    const std::string value( raw );
+    return value == "1" || value == "true" || value == "TRUE" ||
+           value == "yes" || value == "YES";
+}
 
 struct ground_consumable_snapshot {
     std::string name;
@@ -219,6 +230,7 @@ struct state_snapshot {
     bool indoors = false;
     bool is_night_time = false;
     bool dead = false;
+    bool validation_mode = false;
     std::string activity;
     std::vector<local_tile_snapshot> local_tiles;
     std::vector<strategic_landmark_snapshot> strategic_landmarks;
@@ -266,6 +278,7 @@ static state_snapshot snapshot( avatar &u )
     state.indoors = !m.is_outside( pos );
     state.is_night_time = is_night( calendar::turn );
     state.dead = u.is_dead_state();
+    state.validation_mode = validation_mode_enabled();
     state.activity = u.activity ? u.activity.id().str() : std::string();
 
     const bool inside = !m.is_outside( pos );
@@ -480,6 +493,7 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
     jsout.member( "indoors", state.indoors );
     jsout.member( "is_night", state.is_night_time );
     jsout.member( "dead", state.dead );
+    jsout.member( "validation_mode", state.validation_mode );
     jsout.member( "activity", state.activity );
 
     jsout.member( "local_tiles" );
@@ -760,8 +774,10 @@ static bool wait_for_turn_action( avatar &u, map &m )
         int dx = 0;
         int dy = 0;
         int duration_minutes = 480;
+        int value = 0;
         std::string item_name;
         std::string item_type_id;
+        std::string terrain_id;
         try {
             std::ifstream fin( command );
             TextJsonIn jsin( fin );
@@ -771,8 +787,10 @@ static bool wait_for_turn_action( avatar &u, map &m )
             dx = jo.get_int( "dx", 0 );
             dy = jo.get_int( "dy", 0 );
             duration_minutes = jo.get_int( "duration_minutes", 480 );
+            value = jo.get_int( "value", 0 );
             item_name = jo.get_string( "item_name", "" );
             item_type_id = jo.get_string( "item_type_id", "" );
+            terrain_id = jo.get_string( "terrain_id", "" );
         } catch( const std::exception &err ) {
             const state_snapshot current = snapshot( u );
             fs::remove( command, ec );
@@ -783,6 +801,115 @@ static bool wait_for_turn_action( avatar &u, map &m )
         fs::remove( command, ec );
 
         const state_snapshot before = snapshot( u );
+
+        const bool validation_action = action.rfind( "validation_", 0 ) == 0;
+        if( validation_action && !validation_mode_enabled() ) {
+            write_response( dir, command_id, action, false, "validation_mode_required",
+                            before, before, false, false,
+                            "Set NOVA_VALIDATION_MODE=1 before launching CDDA; never use validation commands on a real life." );
+            continue;
+        }
+
+        if( action == "validation_give_item" || action == "validation_place_item" ) {
+            const itype_id type( item_type_id );
+            if( item_type_id.empty() || !type.is_valid() ) {
+                write_response( dir, command_id, action, false, "invalid_item_type",
+                                before, before, false, false,
+                                "item_type_id must name a valid loaded CDDA item type" );
+                continue;
+            }
+            item fixture( type, calendar::turn );
+            bool placed = false;
+            if( action == "validation_give_item" ) {
+                item_location added = u.i_add( fixture, true, nullptr, nullptr, false, false );
+                placed = static_cast<bool>( added );
+            } else {
+                if( dx < -2 || dx > 2 || dy < -2 || dy > 2 ) {
+                    write_response( dir, command_id, action, false, "invalid_delta",
+                                    before, before, false, false );
+                    continue;
+                }
+                const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+                if( !m.inbounds( target ) ) {
+                    write_response( dir, command_id, action, false, "out_of_bounds",
+                                    before, before, false, false );
+                    continue;
+                }
+                item &placed_item = m.add_item_or_charges( target, fixture, false );
+                placed = !placed_item.is_null();
+            }
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, placed,
+                            placed ? "validation_fixture_created" : "validation_fixture_failed",
+                            before, after, placed, false );
+            continue;
+        }
+
+        if( action == "validation_set_terrain" ) {
+            if( dx < -2 || dx > 2 || dy < -2 || dy > 2 || ( dx == 0 && dy == 0 ) ) {
+                write_response( dir, command_id, action, false, "invalid_delta",
+                                before, before, false, false );
+                continue;
+            }
+            const ter_str_id terrain( terrain_id );
+            if( terrain_id.empty() || !terrain.is_valid() ) {
+                write_response( dir, command_id, action, false, "invalid_terrain_id",
+                                before, before, false, false );
+                continue;
+            }
+            const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+            const bool changed = m.inbounds( target ) && m.ter_set( target, terrain.id(), true );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, changed,
+                            changed ? "validation_terrain_set" : "validation_terrain_failed",
+                            before, after, changed, false );
+            continue;
+        }
+
+        if( action == "validation_set_hunger" ) {
+            u.set_hunger( value );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, after.hunger == value,
+                            after.hunger == value ? "validation_value_set" : "validation_value_mismatch",
+                            before, after, false, false );
+            continue;
+        }
+
+        if( action == "validation_set_thirst" ) {
+            u.set_thirst( value );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, after.thirst == value,
+                            after.thirst == value ? "validation_value_set" : "validation_value_mismatch",
+                            before, after, false, false );
+            continue;
+        }
+
+        if( action == "validation_set_sleepiness" ) {
+            u.set_sleepiness( value );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, after.sleepiness == value,
+                            after.sleepiness == value ? "validation_value_set" : "validation_value_mismatch",
+                            before, after, false, false );
+            continue;
+        }
+
+        if( action == "validation_set_stamina" ) {
+            const int clamped = std::clamp( value, 0, u.get_stamina_max() );
+            u.set_stamina( clamped );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, after.stamina == clamped,
+                            after.stamina == clamped ? "validation_value_set" : "validation_value_mismatch",
+                            before, after, false, false );
+            continue;
+        }
+
+        if( action == "validation_kill_character" ) {
+            u.die( &m, nullptr );
+            const state_snapshot after = snapshot( u );
+            write_response( dir, command_id, action, after.dead, "validation_character_killed",
+                            before, after, true, false );
+            return true;
+        }
 
         if( action == "observe" ) {
             write_response( dir, command_id, action, true, "observed",
@@ -1079,7 +1206,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
 
         write_response( dir, command_id, action, false, "unsupported_action",
                         before, before, false, false,
-                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, close_adjacent, pickup_consumable, pickup_item, wield_item, wear_item, eat_best_food, drink_best, sleep, quicksave" );
+                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, close_adjacent, pickup_consumable, pickup_item, wield_item, wear_item, eat_best_food, drink_best, sleep, quicksave. Validation-only fixture commands require NOVA_VALIDATION_MODE=1." );
     }
 }
 
