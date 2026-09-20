@@ -2178,6 +2178,61 @@ def clear_active_life_marker() -> None:
     except OSError:
         pass
 
+def recover_user_interrupted_life(evolution_state: dict, state: dict) -> LifeTelemetry | None:
+    """Restore the same life identity after an older Ctrl+C stop was logged as aborted."""
+    if read_json_safe(ACTIVE_LIFE_PATH):
+        return None
+    if evolution_state.get("current_life_id"):
+        return None
+    if bool(state.get("dead")):
+        return None
+
+    records = load_recent_life_history(limit=1, include_aborted=True)
+    if not records:
+        return None
+    record = records[-1]
+    if record.get("terminal_state") != "aborted" or record.get("abort_reason") != "user_interrupt":
+        return None
+
+    life_id = str(record.get("life_id") or "").strip()
+    if not life_id:
+        return None
+    life_number = int(record.get("life_number", 1) or 1)
+    started_at = str(record.get("started_at") or utc_now())
+    final_state = record.get("final_state") or {}
+    final_turn = final_state.get("turn")
+    duration_turns = record.get("duration_game_turns")
+    try:
+        if final_turn is not None and duration_turns is not None:
+            started_turn = int(final_turn) - int(duration_turns)
+        else:
+            started_turn = int(state.get("turn", 0) or 0)
+    except Exception:
+        started_turn = int(state.get("turn", 0) or 0)
+
+    life = LifeTelemetry(
+        life_id=life_id,
+        life_number=life_number,
+        started_at=started_at,
+        started_turn=started_turn,
+    )
+    life.last_actions = deque(record.get("last_actions") or [], maxlen=50)
+    life.needs_history = list(record.get("needs_history") or [])
+    life.hostile_encounters = list(record.get("hostile_encounters") or [])
+    life.resources_gained = dict(record.get("resources_gained") or {
+        "items": [], "water_actions": 0, "food_actions": 0
+    })
+    life.observe(state, len(life.last_actions), force_sample=True)
+
+    evolution_state["current_life_id"] = life_id
+    evolution_state["current_life_started_at"] = started_at
+    evolution_state["current_life_started_turn"] = started_turn
+    evolution_state["next_life_number"] = life_number
+    evolution_state["life_number"] = life_number
+    save_evolution_state(evolution_state)
+    write_active_life_marker(life)
+    return life
+
 def ensure_current_life(evolution_state: dict, state: dict) -> LifeTelemetry:
     marker = read_json_safe(ACTIVE_LIFE_PATH)
     current_id = evolution_state.get("current_life_id")
@@ -2502,10 +2557,14 @@ def main() -> int:
         return 0
 
     marker_before_life = read_json_safe(ACTIVE_LIFE_PATH)
-    life = ensure_current_life(evolution_state, state)
+    recovered_interrupt_life = recover_user_interrupted_life(evolution_state, state)
+    life = recovered_interrupt_life or ensure_current_life(evolution_state, state)
     resumed_existing_attempt = bool(
-        marker_before_life
-        and str(marker_before_life.get("life_id")) == life.life_id
+        recovered_interrupt_life
+        or (
+            marker_before_life
+            and str(marker_before_life.get("life_id")) == life.life_id
+        )
     )
     life_number = life.life_number
     log_life_started(log_path, life, resumed_existing_attempt)
@@ -2833,8 +2892,22 @@ def main() -> int:
     
     except KeyboardInterrupt:
         abort_reason = "user_interrupt"
+        life.observe(state, action_count, force_sample=True)
+        write_active_life_marker(life)
+        append_log(log_path, {
+            "wall_time": utc_now(),
+            "session_event": "manual_stop",
+            "life_id": life.life_id,
+            "life_number": life.life_number,
+            "terminal_record_written": False,
+            "active_marker_preserved": True,
+        })
+        feed.push("SESSION: manually stopped; life identity preserved.")
         print()
-        print("Nova runtime interrupted by user; recording this attempt as aborted.")
+        print("Nova runtime stopped by user; current life identity was preserved.")
+        print(f"Life {life.life_number} / {life.life_id[:8]} can resume later.")
+        print(f"Log saved to: {log_path}")
+        return 130
 
     if transport_failure is not None:
         # Transport/runtime failure is not a life event. Preserve the active
