@@ -144,6 +144,9 @@ struct local_tile_snapshot {
     bool swimmable = false;
     bool deep_water = false;
     bool dangerous = false;
+    bool movement_hazard = false;
+    bool special_movement = false;
+    int move_cost = 0;
     std::vector<std::string> items;
     std::vector<ground_consumable_snapshot> consumables;
 };
@@ -247,6 +250,10 @@ static state_snapshot snapshot( avatar &u )
             tile.deep_water = m.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, p ) &&
                               !m.has_flag_furn( "BRIDGE", p );
             tile.dangerous = g->is_dangerous_tile( p );
+            tile.move_cost = m.move_cost( p );
+            tile.movement_hazard = tile.dangerous || tile.deep_water;
+            tile.special_movement =
+                tile.movement_hazard || tile.swimmable || tile.move_cost > 2;
             int item_count = 0;
             for( const item &it : m.i_at( p ) ) {
                 if( item_count >= 3 ) {
@@ -348,6 +355,9 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
         jsout.member( "swimmable", tile.swimmable );
         jsout.member( "deep_water", tile.deep_water );
         jsout.member( "dangerous", tile.dangerous );
+        jsout.member( "movement_hazard", tile.movement_hazard );
+        jsout.member( "special_movement", tile.special_movement );
+        jsout.member( "move_cost", tile.move_cost );
         jsout.member( "items" );
         jsout.start_array();
         for( const std::string &name : tile.items ) {
