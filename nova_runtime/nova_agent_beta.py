@@ -1145,6 +1145,7 @@ def apply_lesson_bias(state: dict, actions: list[dict],
         matches.append({
             "lesson_id": lesson.get("lesson_id"),
             "text": lesson.get("text"),
+            "conditions": dict(recorded),
             "at_death_action": action_name,
             "match_count": score,
         })
