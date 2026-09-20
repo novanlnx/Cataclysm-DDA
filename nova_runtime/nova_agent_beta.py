@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import time
@@ -797,11 +798,16 @@ class DashboardFeed:
                matched_lessons: list[dict] | None = None,
                blocker: str = "") -> None:
         phase = mission_phase(state, wm)
-        goal = plan.goal_id if plan else (wm.active_goal_id or "reassess")
-        intention = plan.intention if plan else (wm.active_intention or "reassess situation")
+        goal = plan.goal_id if plan else (wm.active_goal_id or "replanning")
+        intention = plan.intention if plan else (wm.active_intention or "replanning from current evidence")
         step = "none"
         if plan and plan.current_step:
             step = f"{plan.step_index + 1}/{len(plan.steps)} {plan.current_step.kind}"
+            if plan.current_step.kind == "go_to":
+                route = plan.current_step.params.get("route") or []
+                repairs = int(plan.current_step.params.get("route_repairs", 0) or 0)
+                if route:
+                    step += f" route={len(route)} repairs={repairs}"
         targets = known_structure_targets(state, wm)
         target_line = "none known"
         if targets:
@@ -2158,12 +2164,9 @@ def absolute_target_from_relative(state: dict, dx: int, dy: int) -> dict:
 
 def plan_step_complete_before_action(step: PlanStep, state: dict) -> bool:
     if step.kind == "go_to" and step.target:
-        x, y, z = pos_tuple(state)
-        tx = int(step.target.get("x", x))
-        ty = int(step.target.get("y", y))
-        tz = int(step.target.get("z", z))
-        radius = int(step.params.get("arrival_radius", 0) or 0)
-        return z == tz and max(abs(tx - x), abs(ty - y)) <= radius
+        return navigation_distance(step, pos_tuple(state)) <= int(
+            step.params.get("arrival_radius", 0) or 0
+        )
     if step.kind == "interact" and step.target and str(step.params.get("action", "")) == "open_adjacent":
         x, y, z = pos_tuple(state)
         tx = int(step.target.get("x", x))
@@ -2204,48 +2207,282 @@ def select_interaction(actions: list[dict], action_name: str,
         ),
     )
 
-def deterministic_move_toward(step: PlanStep, state: dict, actions: list[dict]) -> dict | None:
+def navigation_distance(step: PlanStep, point: tuple[int, int, int]) -> int:
     if not step.target:
-        return None
-    x, y, z = pos_tuple(state)
+        return 10**9
+    x, y, z = point
     tx = int(step.target.get("x", x))
     ty = int(step.target.get("y", y))
     tz = int(step.target.get("z", z))
     if z != tz:
+        return 10**9
+    if str(step.params.get("arrival_metric", "chebyshev")) == "manhattan":
+        return abs(tx - x) + abs(ty - y)
+    return max(abs(tx - x), abs(ty - y))
+
+def navigation_edge_key(a: tuple[int, int, int],
+                        b: tuple[int, int, int]) -> tuple[int, int, int, int, int, int]:
+    return (a[0], a[1], a[2], b[0], b[1], b[2])
+
+def navigation_tile_cost(wm: WorldModel, key: tuple[int, int, int],
+                         diagonal: bool) -> int | None:
+    if key in wm.hazard_tiles:
         return None
+    tile = wm.known_tiles.get(key)
+    base = 14 if diagonal else 10
+    if tile is None:
+        # Unknown space is allowed optimistically so a strategic target outside
+        # the 5x5 local snapshot remains reachable, but known safe terrain wins.
+        return base + 24
+    if bool(tile.get("movement_hazard")) or bool(tile.get("dangerous")) or bool(tile.get("deep_water")):
+        return None
+    if bool(tile.get("passable")):
+        move_cost = max(2, int(tile.get("move_cost", 2) or 2))
+        penalty = max(0, move_cost - 2) * 5
+        if bool(tile.get("special_movement")):
+            penalty += 10
+        return base + penalty
+    if bool(tile.get("openable")):
+        # A closed door is a traversable route boundary, not a wall.  The
+        # executor will emit open_adjacent before attempting to enter it.
+        return base + 18
+    return None
+
+def astar_route(step: PlanStep, state: dict, wm: WorldModel) -> tuple[list[list[int]], str]:
+    if not step.target:
+        return [], "missing_target"
+    start = pos_tuple(state)
+    tx = int(step.target.get("x", start[0]))
+    ty = int(step.target.get("y", start[1]))
+    tz = int(step.target.get("z", start[2]))
+    if start[2] != tz:
+        return [], "different_z_level"
     radius = int(step.params.get("arrival_radius", 0) or 0)
-    before = max(abs(tx - x), abs(ty - y))
-    if before <= radius:
+    if navigation_distance(step, start) <= radius:
+        return [], "already_at_navigation_boundary"
+
+    hostile_tiles = set()
+    for creature in state.get("nearby_creatures", []):
+        if str(creature.get("attitude", "")).lower() != "hostile":
+            continue
+        try:
+            hostile_tiles.add((
+                start[0] + int(creature.get("dx", 0) or 0),
+                start[1] + int(creature.get("dy", 0) or 0),
+                start[2],
+            ))
+        except Exception:
+            pass
+
+    temporary_avoid = set()
+    for raw in step.params.get("route_avoid_edges") or []:
+        try:
+            if len(raw) == 6:
+                temporary_avoid.add(tuple(int(v) for v in raw))
+        except Exception:
+            pass
+
+    direct = max(abs(tx - start[0]), abs(ty - start[1]))
+    margin = max(12, min(32, direct + 8))
+    min_x = min(start[0], tx) - margin
+    max_x = max(start[0], tx) + margin
+    min_y = min(start[1], ty) - margin
+    max_y = max(start[1], ty) + margin
+    max_expansions = 6000
+
+    def heuristic(node: tuple[int, int, int]) -> int:
+        dx = abs(tx - node[0])
+        dy = abs(ty - node[1])
+        if str(step.params.get("arrival_metric", "chebyshev")) == "manhattan":
+            return max(0, dx + dy - radius) * 7
+        return max(0, max(dx, dy) - radius) * 10
+
+    frontier = [(heuristic(start), 0, 0, start)]
+    came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    g_score = {start: 0}
+    counter = 0
+    expansions = 0
+    goal = None
+
+    while frontier and expansions < max_expansions:
+        _, current_g, _, current = heapq.heappop(frontier)
+        if current_g != g_score.get(current):
+            continue
+        expansions += 1
+        if navigation_distance(step, current) <= radius:
+            goal = current
+            break
+
+        for dx, dy in MOVE_DIRECTIONS.values():
+            nxt = (current[0] + dx, current[1] + dy, current[2])
+            if nxt[0] < min_x or nxt[0] > max_x or nxt[1] < min_y or nxt[1] > max_y:
+                continue
+            if nxt in hostile_tiles:
+                continue
+            edge = navigation_edge_key(current, nxt)
+            if edge in wm.blocked_edges or edge in temporary_avoid:
+                continue
+
+            diagonal = dx != 0 and dy != 0
+            tile = wm.known_tiles.get(nxt)
+            # Doors are deliberately approached cardinally because the current
+            # action generator exposes open_adjacent only in cardinal directions.
+            if diagonal and tile and bool(tile.get("openable")):
+                continue
+            if diagonal:
+                side_a = wm.known_tiles.get((current[0] + dx, current[1], current[2]))
+                side_b = wm.known_tiles.get((current[0], current[1] + dy, current[2]))
+                side_a_blocked = side_a is not None and navigation_tile_cost(
+                    wm, (current[0] + dx, current[1], current[2]), False
+                ) is None
+                side_b_blocked = side_b is not None and navigation_tile_cost(
+                    wm, (current[0], current[1] + dy, current[2]), False
+                ) is None
+                if side_a_blocked and side_b_blocked:
+                    continue
+
+            traversal = navigation_tile_cost(wm, nxt, diagonal)
+            if traversal is None:
+                continue
+            traversal += min(12, int(wm.visits.get(nxt, 0) or 0) * 2)
+            tentative = current_g + traversal
+            if tentative >= g_score.get(nxt, 10**18):
+                continue
+            came_from[nxt] = current
+            g_score[nxt] = tentative
+            counter += 1
+            heapq.heappush(
+                frontier,
+                (tentative + heuristic(nxt), tentative, counter, nxt),
+            )
+
+    if goal is None:
+        return [], f"no_route_after_{expansions}_expansions"
+
+    route = []
+    node = goal
+    while node != start:
+        route.append([node[0], node[1], node[2]])
+        node = came_from[node]
+    route.reverse()
+    return route, f"route_found_len_{len(route)}_expansions_{expansions}"
+
+def deterministic_move_toward(step: PlanStep, state: dict, wm: WorldModel,
+                              actions: list[dict]) -> dict | None:
+    if not step.target:
+        step.params["route_status"] = "missing_target"
+        return None
+    current = pos_tuple(state)
+    if navigation_distance(step, current) <= int(step.params.get("arrival_radius", 0) or 0):
+        step.params["route_status"] = "arrived"
         return None
 
-    improving = []
-    lateral = []
-    for action in actions:
-        if action.get("action") != "move_one_tile" or action.get("hostile_on_tile"):
-            continue
-        dx = int(action.get("dx", 0) or 0)
-        dy = int(action.get("dy", 0) or 0)
-        after = max(abs(tx - (x + dx)), abs(ty - (y + dy)))
-        row = (
-            after,
-            int(action.get("visits_target", 0) or 0),
-            1 if action.get("immediate_backtrack") else 0,
-            -float(action.get("controller_score", 0.0)),
-            stable_direction_rank(dx, dy),
-            action,
-        )
-        if after < before:
-            improving.append(row)
-        elif after == before:
-            lateral.append(row)
-    candidates = improving or lateral
-    if not candidates:
+    route = step.params.get("route")
+    if not isinstance(route, list):
+        route = []
+    while route:
+        try:
+            if tuple(int(v) for v in route[0]) == current:
+                route.pop(0)
+                continue
+        except Exception:
+            route = []
+        break
+
+    target_signature = [
+        int(step.target.get("x", current[0])),
+        int(step.target.get("y", current[1])),
+        int(step.target.get("z", current[2])),
+        int(step.params.get("arrival_radius", 0) or 0),
+        str(step.params.get("arrival_metric", "chebyshev")),
+    ]
+    if step.params.get("route_target_signature") != target_signature:
+        route = []
+        step.params["route_target_signature"] = target_signature
+
+    def build_route(reason: str) -> list:
+        new_route, status = astar_route(step, state, wm)
+        step.params["route"] = new_route
+        step.params["route_status"] = status
+        step.params["route_replans"] = int(step.params.get("route_replans", 0) or 0) + 1
+        step.params["route_last_replan_reason"] = reason
+        return new_route
+
+    if not route:
+        route = build_route("missing_or_consumed_route")
+    if not route:
+        wm.last_planner_blocker = str(step.params.get("route_status", "route unavailable"))
+        wm.last_planner_next_step = "repair route or choose another reachable target"
         return None
-    candidates.sort(key=lambda row: row[:-1])
-    choice = dict(candidates[0][-1])
-    choice["reason"] = f"executor step toward committed target ({tx},{ty},{tz})"
-    choice["provenance"] = "plan_executor"
-    return choice
+
+    for attempt in range(2):
+        try:
+            nx, ny, nz = (int(v) for v in route[0])
+        except Exception:
+            route = build_route("malformed_cached_route")
+            if not route:
+                return None
+            continue
+        dx, dy = nx - current[0], ny - current[1]
+        if nz != current[2] or abs(dx) > 1 or abs(dy) > 1 or (dx == 0 and dy == 0):
+            route = build_route("cached_route_no_longer_adjacent")
+            if not route:
+                return None
+            continue
+
+        move = next((
+            a for a in actions
+            if a.get("action") == "move_one_tile"
+            and int(a.get("dx", 0) or 0) == dx
+            and int(a.get("dy", 0) or 0) == dy
+            and not a.get("hostile_on_tile")
+        ), None)
+        if move:
+            choice = dict(move)
+            choice["reason"] = (
+                f"A* route step toward committed target; "
+                f"{len(route)} route nodes remain"
+            )
+            choice["provenance"] = "plan_executor"
+            choice["route_next"] = [nx, ny, nz]
+            choice["route_length_remaining"] = len(route)
+            choice["route_replans"] = int(step.params.get("route_replans", 0) or 0)
+            wm.last_planner_blocker = ""
+            wm.last_planner_next_step = f"follow A* route ({len(route)} nodes remaining)"
+            step.params["route"] = route
+            return choice
+
+        opened = next((
+            a for a in actions
+            if a.get("action") == "open_adjacent"
+            and int(a.get("dx", 0) or 0) == dx
+            and int(a.get("dy", 0) or 0) == dy
+        ), None)
+        if opened:
+            choice = dict(opened)
+            choice["reason"] = "A* route requires opening this boundary before continuing"
+            choice["provenance"] = "plan_executor"
+            choice["route_next"] = [nx, ny, nz]
+            choice["route_length_remaining"] = len(route)
+            choice["route_replans"] = int(step.params.get("route_replans", 0) or 0)
+            wm.last_planner_blocker = ""
+            wm.last_planner_next_step = "open route boundary, then continue cached route"
+            step.params["route"] = route
+            return choice
+
+        edge = list(navigation_edge_key(current, (nx, ny, nz)))
+        avoid = list(step.params.get("route_avoid_edges") or [])
+        if edge not in avoid:
+            avoid.append(edge)
+            step.params["route_avoid_edges"] = avoid[-24:]
+        step.params["route_repairs"] = int(step.params.get("route_repairs", 0) or 0) + 1
+        route = build_route("next_route_edge_not_executable")
+        if not route:
+            break
+
+    wm.last_planner_blocker = str(step.params.get("route_status", "route step unavailable"))
+    wm.last_planner_next_step = "route repair failed; planner should reassess target"
+    return None
 
 def deterministic_explore_choice(step: PlanStep, actions: list[dict]) -> dict | None:
     moves = [
@@ -2284,8 +2521,13 @@ def execute_step(plan: Plan, state: dict, wm: WorldModel,
         return None, "plan_complete"
 
     if step.kind == "go_to":
-        choice = deterministic_move_toward(step, state, actions)
-        return choice, "committed go_to execution" if choice else "go_to_no_progress_action"
+        choice = deterministic_move_toward(step, state, wm, actions)
+        status = str(step.params.get("route_status", "unknown"))
+        return (
+            choice,
+            "committed A* route execution"
+            if choice else f"go_to_route_unavailable:{status}"
+        )
 
     if step.kind == "consume":
         action_name = str(step.params.get("action", ""))
@@ -2352,13 +2594,17 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
                 "y": int(target.get("gy", pos_tuple(state)[1])),
                 "z": int(target.get("gz", pos_tuple(state)[2])),
             }
+            boundary_target = target.get("kind") in {"boundary", "shelter_entrance"}
             steps.append(PlanStep(
                 kind="go_to",
                 target=abs_target,
-                params={"arrival_radius": 1},
+                params={
+                    "arrival_radius": 1,
+                    "arrival_metric": "manhattan" if boundary_target else "chebyshev",
+                },
                 completion={"type": "arrived_near"},
             ))
-            if target.get("kind") in {"boundary", "shelter_entrance"}:
+            if boundary_target:
                 steps.append(PlanStep(
                     kind="interact",
                     target=abs_target,
@@ -2720,20 +2966,66 @@ def verify_step(plan: Plan, action: dict, outcome: str, before: dict,
         return True, True, {"evidence": "plan_already_complete"}
 
     if step.kind == "go_to":
-        bx, by, bz = pos_tuple(before)
-        ax, ay, az = pos_tuple(after)
-        tx = int((step.target or {}).get("x", ax))
-        ty = int((step.target or {}).get("y", ay))
-        tz = int((step.target or {}).get("z", az))
+        before_pos = pos_tuple(before)
+        after_pos = pos_tuple(after)
         radius = int(step.params.get("arrival_radius", 0) or 0)
-        before_d = max(abs(tx - bx), abs(ty - by)) if bz == tz else 10**9
-        after_d = max(abs(tx - ax), abs(ty - ay)) if az == tz else 10**9
-        progress = outcome == "moved" and after_d < before_d
+        before_d = navigation_distance(step, before_pos)
+        after_d = navigation_distance(step, after_pos)
+        expected = action.get("route_next")
+        expected_pos = None
+        if isinstance(expected, list) and len(expected) == 3:
+            try:
+                expected_pos = tuple(int(v) for v in expected)
+            except Exception:
+                expected_pos = None
+
+        if outcome == "opened":
+            progress = True
+            complete = after_d <= radius
+            return progress, complete, {
+                "evidence": "route_boundary_opened",
+                "before_distance": before_d,
+                "after_distance": after_d,
+                "route_remaining": len(step.params.get("route") or []),
+                "route_repairs": int(step.params.get("route_repairs", 0) or 0),
+                "target": step.target,
+            }
+
+        moved = outcome == "moved" and before_pos != after_pos
+        route_followed = expected_pos is None or after_pos == expected_pos
+        if moved and route_followed:
+            route = list(step.params.get("route") or [])
+            if route:
+                try:
+                    if tuple(int(v) for v in route[0]) == after_pos:
+                        route.pop(0)
+                except Exception:
+                    route = []
+            step.params["route"] = route
+            progress = True
+        else:
+            progress = False
+            if expected_pos is not None:
+                edge = list(navigation_edge_key(before_pos, expected_pos))
+                avoid = list(step.params.get("route_avoid_edges") or [])
+                if edge not in avoid:
+                    avoid.append(edge)
+                    step.params["route_avoid_edges"] = avoid[-24:]
+            step.params["route"] = []
+            step.params["route_repairs"] = int(step.params.get("route_repairs", 0) or 0) + 1
+            step.params["route_last_execution_failure"] = outcome
+
         complete = after_d <= radius
         return progress, complete, {
-            "evidence": "distance_to_target",
+            "evidence": "astar_route_progress" if progress else "astar_route_mismatch_repair",
             "before_distance": before_d,
             "after_distance": after_d,
+            "route_followed": route_followed,
+            "expected_next": expected_pos,
+            "actual_position": after_pos,
+            "route_remaining": len(step.params.get("route") or []),
+            "route_repairs": int(step.params.get("route_repairs", 0) or 0),
+            "route_status": step.params.get("route_status"),
             "target": step.target,
         }
 
