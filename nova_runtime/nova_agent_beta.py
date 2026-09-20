@@ -788,6 +788,28 @@ class Plan:
             "steps": [step.to_dict() for step in self.steps],
         }
 
+def lesson_memory_summary(match: dict) -> str:
+    lesson_id = str(match.get("lesson_id") or "unknown-lesson")
+    action = str(match.get("at_death_action") or "unknown_action")
+    recorded = match.get("conditions") or {}
+    condition_labels = []
+    if recorded.get("hostile_nearby") is True:
+        condition_labels.append("hostile nearby")
+    if recorded.get("stamina_low") is True:
+        condition_labels.append("low stamina")
+    if recorded.get("hunger_critical") is True:
+        condition_labels.append("critical hunger")
+    if recorded.get("thirst_critical") is True:
+        condition_labels.append("critical thirst")
+    if recorded.get("pain_present") is True:
+        condition_labels.append("pain")
+    if "indoors" in recorded:
+        condition_labels.append("indoors" if recorded.get("indoors") else "outdoors")
+    if recorded.get("night") is True:
+        condition_labels.append("night")
+    context = ", ".join(condition_labels[:5]) or "matching recorded conditions"
+    return f"{lesson_id}: avoid/reconsider {action} when {context}"
+
 class DashboardFeed:
     def __init__(self) -> None:
         self.mission_path = BRIDGE / "nova-mission.txt"
@@ -846,7 +868,9 @@ class DashboardFeed:
         ]
         lesson_line = "none"
         if matched_lessons:
-            lesson_line = ", ".join(str(m.get("lesson_id")) for m in matched_lessons[:2])
+            lesson_line = " | ".join(
+                lesson_memory_summary(m) for m in matched_lessons[:2]
+            )
         status_lines = [
             f"NEEDS: hunger={state.get('hunger')} thirst={state.get('thirst')} stamina={state.get('stamina')}/{state.get('stamina_max')}",
             f"PLACE: {'indoors' if state.get('indoors') else 'outdoors'} | hostiles={len(hostiles)} | landmarks={len(wm.known_landmarks)}",
@@ -3853,10 +3877,7 @@ def publish_lesson_signal(wm: WorldModel, matched_lessons: list[dict],
         return False
 
     first = matched_lessons[0]
-    memory_line = (
-        f"MEMORY: biasing away from {first.get('at_death_action')} — "
-        "similar conditions killed me before."
-    )
+    memory_line = "MEMORY: " + lesson_memory_summary(first)
     feed.push(memory_line)
     append_log(log_path, {
         "wall_time": utc_now(),
