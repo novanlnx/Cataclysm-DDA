@@ -77,6 +77,11 @@ STAMINA_LOW_RATIO = 0.35
 LESSON_MATCH_THRESHOLD = 3
 LESSON_ACTION_BIAS = 0.35
 FAST_FRONTIER_MOVES = 64
+SHORELINE_HISTORY = 32
+SHORELINE_TRIGGER_SAMPLES = 12
+SHORELINE_NEAR_DISTANCE = 2
+SHORELINE_ESCAPE_DISTANCE = 7
+SHORELINE_CLEAR_SAMPLES = 6
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -438,6 +443,9 @@ class WorldModel:
     progress_epoch: int = 0
     no_progress_streak: int = 0
     goal_no_progress: dict[str, int] = field(default_factory=dict)
+    recent_water_distance: deque = field(default_factory=lambda: deque(maxlen=SHORELINE_HISTORY))
+    shoreline_escape_active: bool = False
+    shoreline_clear_streak: int = 0
 
     def observe(self, state: dict) -> None:
         p = pos_tuple(state)
@@ -453,6 +461,7 @@ class WorldModel:
                     "terrain": t.get("terrain", ""),
                     "passable": bool(t.get("passable")),
                     "openable": bool(t.get("openable")),
+                    "indoors": bool(t.get("indoors")),
                     "swimmable": bool(t.get("swimmable")),
                     "deep_water": bool(t.get("deep_water")),
                     "dangerous": bool(t.get("dangerous")),
@@ -469,6 +478,29 @@ class WorldModel:
                     self.hazard_tiles.add(tile_key)
             except Exception:
                 pass
+        water_distance = self.nearest_known_water_distance(p)
+        if water_distance is not None:
+            self.recent_water_distance.append(water_distance)
+            recent = list(self.recent_water_distance)
+            near_count = sum(1 for d in recent[-SHORELINE_TRIGGER_SAMPLES:] if d <= SHORELINE_NEAR_DISTANCE)
+            if (
+                not self.shoreline_escape_active
+                and len(recent) >= SHORELINE_TRIGGER_SAMPLES
+                and near_count >= SHORELINE_TRIGGER_SAMPLES - 2
+            ):
+                self.shoreline_escape_active = True
+                self.shoreline_clear_streak = 0
+
+            if self.shoreline_escape_active:
+                if water_distance >= SHORELINE_ESCAPE_DISTANCE:
+                    self.shoreline_clear_streak += 1
+                else:
+                    self.shoreline_clear_streak = 0
+                if self.shoreline_clear_streak >= SHORELINE_CLEAR_SAMPLES:
+                    self.shoreline_escape_active = False
+                    self.shoreline_clear_streak = 0
+                    self.recent_water_distance.clear()
+
         for c in state.get("nearby_creatures", []):
             name = str(c.get("name", "creature"))
             self.seen_hostiles[name] = {
@@ -480,6 +512,19 @@ class WorldModel:
     def edge_key(self, state: dict, dx: int, dy: int) -> tuple[int, int, int, int, int, int]:
         x, y, z = pos_tuple(state)
         return (x, y, z, x + dx, y + dy, z)
+
+    def nearest_known_water_distance(self, point: tuple[int, int, int]) -> int | None:
+        x, y, z = point
+        distances = [
+            max(abs(gx - x), abs(gy - y))
+            for (gx, gy, gz), tile in self.known_tiles.items()
+            if gz == z and (bool(tile.get("swimmable")) or bool(tile.get("deep_water")))
+        ]
+        return min(distances) if distances else None
+
+    def target_water_distance(self, state: dict, dx: int, dy: int) -> int | None:
+        x, y, z = pos_tuple(state)
+        return self.nearest_known_water_distance((x + dx, y + dy, z))
 
     def target_key(self, state: dict, dx: int, dy: int) -> tuple[int, int, int]:
         x, y, z = pos_tuple(state)
@@ -1132,6 +1177,14 @@ def goal_candidates(state: dict, actions: list[dict], wm: WorldModel | None = No
             "supported_by": ["open_adjacent", "move_one_tile"],
             "priority": 0.76,
         })
+    if any(a.get("navigation_override") == "leave_shoreline" for a in actions):
+        candidates.append({
+            "goal_id": "leave_shoreline",
+            "intention": "move inland because recent exploration has stayed too close to the shoreline",
+            "supported_by": ["move_one_tile"],
+            "priority": 0.99,
+            "navigation_override": True,
+        })
     if any(a.get("stall_escape") for a in actions):
         candidates.append({
             "goal_id": "escape_local_stall",
@@ -1203,6 +1256,7 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
     wm.refresh_stall_escape(state)
     visible_resources = visible_storable_consumables(state)
     known_resources = known_storable_consumables(state, wm)
+    current_water_distance = wm.nearest_known_water_distance(pos_tuple(state))
 
     for name, (dx, dy) in CARDINALS.items():
         t = tiles.get((dx, dy))
@@ -1266,6 +1320,18 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 score -= 0.20
             if move_cost > 2:
                 score -= min(0.20, 0.03 * (move_cost - 2))
+
+            target_water_distance = wm.target_water_distance(state, dx, dy)
+            shoreline_delta = 0
+            if current_water_distance is not None and target_water_distance is not None:
+                shoreline_delta = target_water_distance - current_water_distance
+                if wm.shoreline_escape_active:
+                    if shoreline_delta > 0:
+                        score += min(0.75, 0.30 * shoreline_delta)
+                    elif shoreline_delta < 0:
+                        score -= 0.85
+                    else:
+                        score -= 0.20
             resource_distance_delta = 0
             nearest_resource = None
             if known_resources:
@@ -1308,6 +1374,10 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "move_cost": move_cost,
                 "navigation_rank": 2 if shallow_water else (1 if special_movement else 0),
                 "stall_recent_target": wm.target_key(state, dx, dy) in wm.stall_avoid_tiles,
+                "shoreline_escape": wm.shoreline_escape_active,
+                "water_distance_before": current_water_distance,
+                "water_distance_after": target_water_distance,
+                "shoreline_distance_delta": shoreline_delta,
                 "visits_target": visits,
                 "immediate_backtrack": backtrack,
                 "hostile_on_tile": (dx, dy) in hostiles,
@@ -1316,6 +1386,37 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
                 "controller_score": max(0.0, min(1.0, score)),
                 "progress": progress,
             })
+
+    # Macro shoreline escape. Local movement can be valid on every step while
+    # still making strategically useless progress parallel to a coast. When
+    # sustained water adjacency is detected, and at least one safe step increases
+    # distance from known water, ordinary movement is temporarily narrowed to
+    # those away-from-water choices until Nova is well clear of the shoreline.
+    if wm.shoreline_escape_active:
+        move_actions = [a for a in actions if a.get("action") == "move_one_tile"]
+        away_moves = [
+            a for a in move_actions
+            if int(a.get("shoreline_distance_delta", 0) or 0) > 0
+        ]
+        if away_moves:
+            away_keys = {
+                (int(a.get("dx", 0) or 0), int(a.get("dy", 0) or 0))
+                for a in away_moves
+            }
+            narrowed = []
+            for action in actions:
+                if action.get("action") != "move_one_tile":
+                    narrowed.append(action)
+                    continue
+                key = (int(action.get("dx", 0) or 0), int(action.get("dy", 0) or 0))
+                if key in away_keys:
+                    item = dict(action)
+                    item["navigation_override"] = "leave_shoreline"
+                    item["controller_score"] = min(
+                        1.0, float(item.get("controller_score", 0.0)) + 0.25
+                    )
+                    narrowed.append(item)
+            actions = narrowed
 
     # Generic stall breaker. If Nova has been pacing or making no net
     # progress, and at least one safe move exits the recent local cluster,
@@ -1416,6 +1517,8 @@ def available_actions(state: dict, wm: WorldModel) -> list[dict]:
 def needs_qwen_judgment(state: dict, wm: WorldModel, actions: list[dict]) -> bool:
     # Qwen is for judgment, not footsteps. Empty, repetitive traversal should
     # stay fast until something appears that can materially change the choice.
+    if wm.shoreline_escape_active:
+        return True
     if wm.looping() or wm.no_progress_streak >= 2:
         return True
     if any(str(c.get("attitude", "")).lower() == "hostile"
@@ -1498,6 +1601,12 @@ def compact_world(state: dict, wm: WorldModel, actions: list[dict]) -> dict:
         "active_goal_id": wm.active_goal_id or None,
         "active_intention": wm.active_intention or None,
         "no_progress_streak": wm.no_progress_streak,
+        "shoreline_context": {
+            "escape_active": wm.shoreline_escape_active,
+            "recent_water_distance": list(wm.recent_water_distance)[-16:],
+            "current_water_distance": wm.nearest_known_water_distance(pos_tuple(state)),
+            "clear_distance": SHORELINE_ESCAPE_DISTANCE,
+        },
         "active_goal_no_progress": wm.goal_no_progress.get(wm.active_goal_id, 0),
         "goal_candidates": goal_candidates(state, actions, wm),
         "allowed_actions": actions,
@@ -1765,6 +1874,12 @@ def synthesize_plan_from_goal(goal: dict, state: dict, wm: WorldModel,
             params={"max_successful_moves": 8, "successful_moves": 0},
             completion={"type": "explore_budget"},
         ))
+    elif goal_id == "leave_shoreline":
+        steps.append(PlanStep(
+            kind="explore",
+            params={"max_successful_moves": 24, "successful_moves": 0},
+            completion={"type": "explore_budget"},
+        ))
     else:
         steps.append(PlanStep(
             kind="explore",
@@ -1880,6 +1995,9 @@ def should_interrupt_plan(plan: Plan, state: dict, wm: WorldModel,
     step = plan.current_step
     if step is None:
         return "plan_complete"
+
+    if plan.goal_id == "leave_shoreline" and not wm.shoreline_escape_active:
+        return "shoreline_cleared"
 
     if plan.provenance == "fast_frontier" and needs_qwen_judgment(state, wm, actions):
         return "meaningful_judgment_event"
@@ -2961,6 +3079,8 @@ def main() -> int:
                     "known_blocked_edges": len(wm.blocked_edges),
             "known_hazard_tiles": len(wm.hazard_tiles),
             "stall_escape_active": bool(wm.stall_avoid_tiles),
+            "shoreline_escape_active": wm.shoreline_escape_active,
+            "current_water_distance": wm.nearest_known_water_distance(pos_tuple(state)),
                 },
             })
     
