@@ -298,7 +298,16 @@ static state_snapshot snapshot( avatar &u )
             if( !m.inbounds( p ) ) {
                 continue;
             }
-            if( !m.is_outside( p ) && m.passable( p ) ) {
+            const bool strategic_openable = m.open_door( u, p, inside, true );
+            if( strategic_openable ) {
+                landmark_candidates.push_back( {
+                    "shelter_entrance",
+                    m.name( p ),
+                    dx,
+                    dy,
+                    std::max( std::abs( dx ), std::abs( dy ) )
+                } );
+            } else if( !m.is_outside( p ) && m.passable( p ) ) {
                 landmark_candidates.push_back( {
                     "shelter_interior",
                     m.name( p ),
@@ -311,6 +320,11 @@ static state_snapshot snapshot( avatar &u )
     }
     std::sort( landmark_candidates.begin(), landmark_candidates.end(),
     []( const strategic_landmark_snapshot &lhs, const strategic_landmark_snapshot &rhs ) {
+        const int lhs_rank = lhs.kind == "shelter_entrance" ? 0 : 1;
+        const int rhs_rank = rhs.kind == "shelter_entrance" ? 0 : 1;
+        if( lhs_rank != rhs_rank ) {
+            return lhs_rank < rhs_rank;
+        }
         if( lhs.distance != rhs.distance ) {
             return lhs.distance < rhs.distance;
         }
