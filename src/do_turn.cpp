@@ -133,6 +133,12 @@ struct ground_consumable_snapshot {
     bool storable_without_wield = false;
 };
 
+struct ground_item_snapshot {
+    std::string name;
+    bool storable_without_wield = false;
+    bool consumable = false;
+};
+
 struct local_tile_snapshot {
     int dx = 0;
     int dy = 0;
@@ -148,6 +154,7 @@ struct local_tile_snapshot {
     bool special_movement = false;
     int move_cost = 0;
     std::vector<std::string> items;
+    std::vector<ground_item_snapshot> ground_items;
     std::vector<ground_consumable_snapshot> consumables;
 };
 
@@ -268,13 +275,20 @@ static state_snapshot snapshot( avatar &u )
                 if( item_count >= 3 ) {
                     break;
                 }
+                const bool is_consumable = static_cast<bool>( it.get_comestible() );
+                const bool storable_without_wield = u.can_add( it, nullptr, false );
                 tile.items.push_back( it.tname() );
-                if( it.get_comestible() ) {
+                tile.ground_items.push_back( {
+                    it.tname(),
+                    storable_without_wield,
+                    is_consumable
+                } );
+                if( is_consumable ) {
                     tile.consumables.push_back( {
                         it.tname(),
                         u.nutrition_for( it ),
                         it.get_comestible()->quench,
-                        u.can_add( it, nullptr, false )
+                        storable_without_wield
                     } );
                 }
                 ++item_count;
@@ -439,6 +453,16 @@ static void write_state( JsonOut &jsout, const state_snapshot &state )
         jsout.start_array();
         for( const std::string &name : tile.items ) {
             jsout.write( name );
+        }
+        jsout.end_array();
+        jsout.member( "ground_items" );
+        jsout.start_array();
+        for( const ground_item_snapshot &ground_item : tile.ground_items ) {
+            jsout.start_object();
+            jsout.member( "name", ground_item.name );
+            jsout.member( "storable_without_wield", ground_item.storable_without_wield );
+            jsout.member( "consumable", ground_item.consumable );
+            jsout.end_object();
         }
         jsout.end_array();
         jsout.member( "ground_consumables" );
@@ -710,7 +734,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
             return true;
         }
 
-        if( action == "pickup_consumable" ) {
+        if( action == "pickup_consumable" || action == "pickup_item" ) {
             if( dx < -1 || dx > 1 || dy < -1 || dy > 1 ) {
                 write_response( dir, command_id, action, false, "invalid_delta",
                                 before, before, false, false );
@@ -723,12 +747,13 @@ static bool wait_for_turn_action( avatar &u, map &m )
                 continue;
             }
 
+            const bool consumable_only = action == "pickup_consumable";
             bool obtained = false;
             bool matched = false;
             bool safe_storage = false;
             map_cursor cursor( &m, target );
             for( item &it : m.i_at( target ) ) {
-                if( !it.get_comestible() ) {
+                if( consumable_only && !it.get_comestible() ) {
                     continue;
                 }
                 if( !item_name.empty() && it.tname() != item_name ) {
@@ -752,7 +777,8 @@ static bool wait_for_turn_action( avatar &u, map &m )
             const state_snapshot after = snapshot( u );
             const bool inventory_changed = after.inventory_count > before.inventory_count ||
                                            after.consumables.size() > before.consumables.size();
-            const bool verified = obtained && safe_storage && inventory_changed;
+            const bool verified = obtained && safe_storage &&
+                                  ( action == "pickup_item" || inventory_changed );
             const std::string pickup_outcome =
                 !matched ? "item_unavailable" :
                 !safe_storage ? "no_safe_storage" :
@@ -867,7 +893,7 @@ static bool wait_for_turn_action( avatar &u, map &m )
 
         write_response( dir, command_id, action, false, "unsupported_action",
                         before, before, false, false,
-                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, pickup_consumable, eat_best_food, drink_best, sleep, quicksave" );
+                        "Supported: observe, move_one_tile, wait_one_turn, open_adjacent, pickup_consumable, pickup_item, eat_best_food, drink_best, sleep, quicksave" );
     }
 }
 
