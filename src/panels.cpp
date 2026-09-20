@@ -334,8 +334,8 @@ static void decorate_panel( std::string_view name, const catacurses::window &w )
     static const char *title_prefix = " ";
     const std::string_view title = name;
     static const char *title_suffix = " ";
-    static const std::string full_title = string_format( "%s%s%s",
-                                          title_prefix, title, title_suffix );
+    const std::string full_title = string_format( "%s%s%s",
+                                   title_prefix, title, title_suffix );
     const int start_pos = center_text_pos( full_title, 0, getmaxx( w ) - 1 );
     mvwprintz( w, point( start_pos, 0 ), c_white, title_prefix );
     wprintz( w, c_light_red, title );
@@ -353,18 +353,19 @@ static void draw_messages( const draw_args &args )
     wnoutrefresh( w );
 }
 
-static void draw_nova_thoughts( const draw_args &args )
+static void draw_nova_file_panel( const draw_args &args, std::string_view title,
+                                  const char *filename )
 {
     const catacurses::window &w = args._win;
     werase( w );
-    decorate_panel( "Nova", w );
+    decorate_panel( title, w );
 
     std::vector<std::string> lines;
     const char *raw_dir = std::getenv( "NOVA_BRIDGE_DIR" );
     if( raw_dir != nullptr && *raw_dir != '\0' ) {
-        const std::filesystem::path thought_file =
-            std::filesystem::path( raw_dir ) / "nova-thoughts.txt";
-        std::ifstream fin( thought_file );
+        const std::filesystem::path file =
+            std::filesystem::path( raw_dir ) / filename;
+        std::ifstream fin( file );
         std::string line;
         while( std::getline( fin, line ) ) {
             if( !line.empty() ) {
@@ -378,13 +379,28 @@ static void draw_nova_thoughts( const draw_args &args )
     }
 
     const int usable_width = std::max( 1, getmaxx( w ) - 2 );
-    const size_t start = lines.size() > 3 ? lines.size() - 3 : 0;
+    const int max_rows = std::max( 1, getmaxy( w ) - 2 );
     int row = 1;
-    for( size_t i = start; i < lines.size() && row <= 3; ++i, ++row ) {
+    for( size_t i = 0; i < lines.size() && row <= max_rows; ++i, ++row ) {
         mvwprintz( w, point( 1, row ), c_light_cyan,
                    trunc_ellipse( lines[i], static_cast<unsigned int>( usable_width ) ) );
     }
     wnoutrefresh( w );
+}
+
+static void draw_nova_mission( const draw_args &args )
+{
+    draw_nova_file_panel( args, "Nova Mission", "nova-mission.txt" );
+}
+
+static void draw_nova_mind( const draw_args &args )
+{
+    draw_nova_file_panel( args, "Nova Mind", "nova-mind.txt" );
+}
+
+static void draw_nova_status( const draw_args &args )
+{
+    draw_nova_file_panel( args, "Nova Status", "nova-status.txt" );
 }
 
 #if defined(TILES)
@@ -421,9 +437,15 @@ static std::vector<window_panel> initialize_default_custom_panels( const widget 
         ret.emplace_back( row_widget.get_window_panel( width ) );
     }
 
-    // Add Nova's live three-line cognition feed before the ordinary message log.
-    ret.emplace_back( draw_nova_thoughts, "Nova", to_translation( "Nova" ),
-                      5, width, true );
+    // Nova cognitive dashboard: purpose, explicit user-facing reasoning, and
+    // current execution state are separate panels so the operator can see why
+    // the agent is standing still or changing plans.
+    ret.emplace_back( draw_nova_mission, "Nova Mission", to_translation( "Nova Mission" ),
+                      6, width, true );
+    ret.emplace_back( draw_nova_mind, "Nova Mind", to_translation( "Nova Mind" ),
+                      7, width, true );
+    ret.emplace_back( draw_nova_status, "Nova Status", to_translation( "Nova Status" ),
+                      6, width, true );
 
     // Add compass, message log, and map to fill remaining space
     // TODO: Make these into proper widgets
